@@ -1,8 +1,8 @@
-# Ozaki-1 fp (block-FP polynomial bf16 emulation) on GSM8K via vLLM.
+# Ozaki-1 fp (block-FP polynomial bf16 emulation) on MATH-500 via vLLM.
 #
 # Run (single GPU):
 #   CUDA_VISIBLE_DEVICES=<free_gpu> conda run -n quantized-reasoning-models \
-#       python inference_vllm.py --config configs/ozaki1_fp_gsm8k.yaml
+#       python inference_vllm.py --config configs/ozaki1_fp_MATH_500.yaml
 #
 # Any field here can be overridden on the CLI (precedence: CLI > YAML > default).
 # Keys are the inference_vllm.py long flag names without the leading '--'.
@@ -12,9 +12,15 @@ model: ./modelzoo/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
 dataset: MATH-500
 
 # --- Ozaki emulation ---
-ozaki_placement: full   # ozaki on nn.Linear only; attention stays native (the fast path)
+ozaki_placement: linear_only   # ozaki on nn.Linear only; attention stays native (the fast path)
 rslt_type: ozaki1_fp           # block-FP polynomial fp emulation
-nmp: 1                         # block-FP GEMM count (1/3/4/6; higher = more accurate, slower)
+nmp: 1                         # block-FP GEMM count (higher = more accurate, slower)
+gemm_bits: 8                   # GEMM unit width w. 8 = int8 byte-split (native fold; nmp 1/3/4/6).
+#                              # 2/4 = w-bit emulation -> valid nmp 1/3/4/6/9/10/15/16
+#                              # (e.g. w=4 nmp=4 == w=8 nmp=1). w only applies to ozaki1*.
+byte_split_style: all_signed_clamp_pos   # integer chunk method (default). other choices:
+#                              #   all_signed_clamp (legacy abs-max) / all_signed_no_clamp
+#                              #   (MSB digit +-2^(w-1); ozaki1_fp only).
 k: 32                          # reduction-dim chunk size
 weight_cache: true           # default on = cache the block-FP encoded weights (single-GPU safe).
 #                              # set true for speed; nmp=6 cache needs ~3x weight memory -> use 2 GPUs (TP=2).

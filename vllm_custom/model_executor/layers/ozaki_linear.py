@@ -69,7 +69,9 @@ def _prepare_ozaki(s_lst, chunk_size):
 
 
 def build_ozaki_configs(nmp, rslt_type="ozaki1_fp", chunk_size=32, weight_cache=True,
-                        s=None, scale_method="new_compressed", shift_bits=7, M_frac_bits=8):
+                        s=None, scale_method="new_compressed", shift_bits=7, M_frac_bits=8,
+                        nmp_overrides=None, s_overrides=None, gemm_bits=8,
+                        byte_split_style="all_signed_clamp_pos"):
     """CustomGemmConfig + Global{Ozaki1,Ozaki2}Config for a single Ozaki GEMM.
 
     Kept in sync with `inference_ozaki.build_ozaki_configs` / the emulation's `evaluate_ppl.py`
@@ -85,6 +87,15 @@ def build_ozaki_configs(nmp, rslt_type="ozaki1_fp", chunk_size=32, weight_cache=
     `weight_cache=True` builds the encoded weight once and reuses it across forwards (both
     schemes); `weight_cache=False` re-encodes the weight on every forward (keeps only the 1x
     bf16 weight resident -- trades recompute for memory).
+
+    Per-operation overrides (``nmp_overrides`` / ``s_overrides``): a {regex-pattern: value} map
+    (emulation feature, see emulation/llm/config.py). At GEMM dispatch ``batched_gemm`` resolves
+    the per-op nmp/s by ``re.search``-matching the layer name (``custom_gemm_config.name``, set
+    per-layer by OzakiLinearMethod.apply) against each pattern; the first match wins, else the
+    default ``nmp`` / ``s``. NOTE: vLLM FUSES q/k/v into ``qkv_proj`` and gate/up into
+    ``gate_up_proj``, so the matchable linear-layer names are ``qkv_proj`` / ``o_proj`` /
+    ``gate_up_proj`` / ``down_proj`` (+ ``layers.<i>`` for a specific decoder layer) -- the
+    transformers-side ``q_proj`` / ``k_proj`` patterns do NOT exist here.
     """
     # NOTE: the emulation package was refactored (~2026-06) — GlobalOzakiConfig split into
     # GlobalOzakiConfigBase / GlobalOzaki1Config / GlobalOzaki2Config, and the ozaki1 config
@@ -97,24 +108,49 @@ def build_ozaki_configs(nmp, rslt_type="ozaki1_fp", chunk_size=32, weight_cache=
     )
     if rslt_type in ("ozaki1", "ozaki1_fp"):
         # block-FP polynomial path: (nmp_lst, rounding, weight_cache).
+        # nmp_lst stays a single default (the dispatcher asserts len==1 and resolves the per-op
+        # nmp directly, so override values need not be pre-registered).
+        # gemm_bits (=w): 8 = int8 byte-split / native fold; 2/4 = w-bit paths. For rslt_type
+        # 'ozaki1' (int8 reference) w!=8 has no weight_cache, so re-encode every forward.
+        if gemm_bits != 8 and rslt_type == "ozaki1" and weight_cache:
+            raise ValueError("ozaki1 (int8) with gemm_bits!=8 has no weight_cache; pass "
+                             "weight_cache=False, or use rslt_type='ozaki1_fp' for cached w!=8.")
+        # byte_split_style: integer digit-split (chunk) method. 'all_signed_no_clamp' lets the
+        # MSB digit reach +-2^(w-1), which only the bf16 emulation (ozaki1_fp) can represent.
+        if byte_split_style == "all_signed_no_clamp" and rslt_type != "ozaki1_fp":
+            raise ValueError("byte_split_style='all_signed_no_clamp' is ozaki1_fp only (the int8 "
+                             "path cannot represent the +-2^(w-1) MSB digit).")
         from emulation.llm.ozaki_matmul import GlobalOzaki1Config
         oz = GlobalOzaki1Config(
             nmp_lst=[nmp], rounding="round_half_away_from_0",
             weight_cache=weight_cache,
+            nmp_overrides=nmp_overrides,
+            gemm_bits=gemm_bits,
+            byte_split_style=byte_split_style,
         )
     elif rslt_type in ("ozaki2", "ozaki", "ozaki2_fp"):
+        if gemm_bits != 8:
+            raise ValueError(f"gemm_bits={gemm_bits} (w!=8) is an ozaki1 concept; rslt_type="
+                             f"{rslt_type!r} (RNS / CRT) only supports w=8.")
         # RNS / CRT path. Mirrors evaluate_ppl.py's ozaki2 branch.
         if s is None:
             raise ValueError(f"rslt_type={rslt_type!r} (Ozaki-2 / RNS) requires an s value; got "
                              "s=None. Pass --ozaki_s (valid range 2..20).")
         from emulation.llm.ozaki_matmul import GlobalOzaki2Config
-        log2M_tensor, moduli_tensor, invM_tensor, NMi_tensor, M_tensor = _prepare_ozaki([s], chunk_size)
+        # s_lst must hold the default s + every per-op override s (default first) so the RNS
+        # tables for all of them exist and get_for_s can fetch each at dispatch -- mirrors
+        # emulation/llm/config.py::build_global_config. Unlike ozaki1's nmp, ozaki2 looks the
+        # resolved s up in s_lst, so override values MUST be registered here.
+        s_ov = s_overrides or {}
+        s_lst = list(dict.fromkeys([s] + [int(v) for v in s_ov.values()]))
+        log2M_tensor, moduli_tensor, invM_tensor, NMi_tensor, M_tensor = _prepare_ozaki(s_lst, chunk_size)
         oz = GlobalOzaki2Config(
-            s_lst=[s],
+            s_lst=s_lst,
             log2M_tensor=log2M_tensor, moduli_tensor=moduli_tensor, NMi_tensor=NMi_tensor,
             M_tensor=M_tensor, invM_tensor=invM_tensor,
             rounding="round_half_away_from_0",
             shift_bits=shift_bits, M_frac_bits=M_frac_bits, weight_cache=weight_cache,
+            s_overrides=s_ov,
         )
     else:
         raise ValueError(f"Unsupported ozaki rslt_type {rslt_type!r}; expected one of "
@@ -220,6 +256,13 @@ class OzakiLinearMethod(LinearMethodBase):
         # When False, re-encode the weight every forward instead of caching the ~3x B_fold.
         # Keeps only the 1x bf16 weight resident (does NOT free it after first apply).
         self.use_weight_cache = use_weight_cache
+        # Per-op overrides resolve the nmp/s by re.search-matching the layer name against the
+        # override patterns (in batched_gemm). That match key is custom_gemm_config.name, which
+        # the shared gcfg leaves "" -- so we set it per layer in apply(), but ONLY when overrides
+        # are configured, keeping the validated uniform path byte-identical (and avoiding a
+        # per-call config copy) otherwise.
+        self._has_overrides = bool(getattr(oz, "nmp_overrides", None) or
+                                   getattr(oz, "s_overrides", None))
 
     def create_weights(self, layer, input_size_per_partition, output_partition_sizes,
                        input_size, output_size, params_dtype, **extra_weight_attrs):
@@ -243,24 +286,34 @@ class OzakiLinearMethod(LinearMethodBase):
         out_dtype = x.dtype
         # vLLM stores weight as (out_features, in_features) = (N, K); _custom_matmul wants (1, K, N).
 
+        # With per-op overrides, hand _custom_matmul a gcfg whose .name is this layer's qualified
+        # name (e.g. model.layers.0.self_attn.qkv_proj) so batched_gemm can resolve the per-op
+        # nmp/s by pattern-matching it. Without overrides keep the shared gcfg (name="").
+        gcfg = self.gcfg
+        if self._has_overrides:
+            name = getattr(layer, "_ozaki_name", None)
+            if name:
+                gcfg = copy.copy(self.gcfg)
+                gcfg.name = name
+
         if not self.use_weight_cache:
             # No-cache mode: re-encode the weight every forward. The ~3x B_fold is built
             # transiently inside _custom_matmul and freed on return, so only the 1x bf16
             # weight stays resident -> nmp=6 fits a single GPU. Costs a per-forward fold
             # (O(N*K), cheap vs the O(M*N*K) GEMM; amortized over the token batch).
             w = layer.weight.to(x.dtype).t().unsqueeze(0).contiguous()
-            y = _custom_matmul(x3, w, self.gcfg, self.oz,
+            y = _custom_matmul(x3, w, gcfg, self.oz,
                                return_weight_cache=False, out_dtype=out_dtype)
         else:
             wc = getattr(layer, "_ozaki_wc", None)
             if wc is not None:
                 # Cache hit: weight side already encoded; only the activation is encoded here.
-                y = _custom_matmul(x3, None, self.gcfg, self.oz,
+                y = _custom_matmul(x3, None, gcfg, self.oz,
                                    weight_cache=wc, out_dtype=out_dtype)
             else:
                 # First call: encode the weight and stash the cache on the layer.
                 w = layer.weight.to(x.dtype).t().unsqueeze(0).contiguous()
-                result = _custom_matmul(x3, w, self.gcfg, self.oz,
+                result = _custom_matmul(x3, w, gcfg, self.oz,
                                         return_weight_cache=True, out_dtype=out_dtype)
                 if isinstance(result, tuple):
                     y, layer._ozaki_wc = result

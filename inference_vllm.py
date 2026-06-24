@@ -46,8 +46,8 @@ def _make_run_tag(args):
     exclude = {"config", "output_dir", "output_path", "model_name", "tensor_parallel_size",
                "overwrite", "debug", "dataset", "gpu_memory_utilization",
                "max_num_batched_tokens", "max_num_seqs"}
-    ozaki1_only = {"nmp"}
-    ozaki2_only = {"s", "scale_method", "shift_bits", "M_frac_bits", "combine_fp64"}
+    ozaki1_only = {"nmp", "nmp_overrides", "gemm_bits", "byte_split_style"}
+    ozaki2_only = {"s", "scale_method", "shift_bits", "M_frac_bits", "combine_fp64", "s_overrides"}
     if args.ozaki_placement is None:
         exclude |= {"ozaki_placement", "rslt_type", "k", "weight_cache", "ozaki_arch"} | ozaki1_only | ozaki2_only
     elif args.rslt_type in ("ozaki1", "ozaki1_fp"):
@@ -60,6 +60,10 @@ def _make_run_tag(args):
 
 
 def parser_gen():
+    # _kv_int_map parses a per-op override map ("pat=val,..." on the CLI or a YAML {pat: val}
+    # dict) identically to evaluate_ppl.py; needed as the `type=` for --nmp_overrides/--s_overrides
+    # below, so it must be imported before those add_argument calls.
+    from emulation.llm.config import _kv_int_map
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default=None,
                         help="Path to a YAML config file whose entries seed the argparse defaults; "
@@ -111,6 +115,17 @@ def parser_gen():
                              'byte-plane emulation. ozaki2_fp is the validated path.')
     parser.add_argument('--nmp', type=int, default=6,
                         help='Ozaki-1 block-FP polynomial GEMM count (ozaki1 / ozaki1_fp).')
+    parser.add_argument('--gemm_bits', type=int, default=8, choices=[2, 4, 8],
+                        help='Ozaki-1 GEMM unit bit-width w (int_bits = w*nD-1). Default 8 = int8 '
+                             'byte-split / native fold. w=2/4 use the w-bit paths and REQUIRE '
+                             'rslt_type ozaki1 / ozaki1_fp; with ozaki1 (int8 reference) w!=8 has '
+                             'no weight_cache, so set --weight_cache off. (ozaki2 ignores w.)')
+    parser.add_argument('--byte_split_style', type=str, default='all_signed_clamp_pos',
+                        choices=['all_signed_clamp_pos', 'all_signed_clamp', 'all_signed_no_clamp'],
+                        help='Ozaki-1 integer digit-split (chunk) method: all_signed_clamp_pos '
+                             '(default, canonical positive-only overflow prevention), '
+                             'all_signed_clamp (legacy abs-max, conservative), all_signed_no_clamp '
+                             '(MSB digit reaches +-2^(w-1); rslt_type ozaki1_fp ONLY). ozaki2 ignores it.')
     parser.add_argument('--k', type=int, default=32,
                         help='Ozaki reduction-dim chunk size (emulation --k).')
     # Ozaki-2 (RNS / CRT) params -- only used by ozaki2 / ozaki2_fp.
@@ -132,6 +147,19 @@ def parser_gen():
                              'emulation ppl baseline, ~1e-7, ~2x slower). Default is fp32 '
                              'accumulation (faster; representative of real fixed/float accumulators), '
                              'exported as OZAKI2_COMBINE_FP64=0.')
+    # Per-operation nmp/s overrides (emulation feature; same flag names as evaluate_ppl.py).
+    # CLI string "qkv_proj=1,down_proj=3" or a YAML {pattern: value} map. Each pattern
+    # re.search-matches the qualified linear-layer name; first match wins, else the default
+    # --nmp / --s. NOTE: vLLM fuses q/k/v -> qkv_proj and gate/up -> gate_up_proj, so the
+    # matchable names are qkv_proj / o_proj / gate_up_proj / down_proj (+ layers.<i>); the
+    # transformers-side q_proj / k_proj names do not exist here. Only the linear-only / full
+    # placements route linear layers, so overrides take effect there.
+    parser.add_argument('--nmp_overrides', type=_kv_int_map, default=None,
+                        help='Per-op nmp overrides for ozaki1 / ozaki1_fp; CLI "qkv_proj=1,o_proj=3" '
+                             'or YAML {pattern: nmp}. Default nmp from --nmp applies elsewhere.')
+    parser.add_argument('--s_overrides', type=_kv_int_map, default=None,
+                        help='Per-op s overrides for ozaki2 / ozaki2_fp; CLI "qkv_proj=2,down_proj=4" '
+                             'or YAML {pattern: s}. Default s from --s applies elsewhere.')
     parser.add_argument('--ozaki_arch', type=str, default='Qwen2OzakiForCausalLM',
                         help='Registered vLLM architecture to override into the model config.')
     parser.add_argument('--gpu_memory_utilization', type=float, default=0.9)
@@ -158,6 +186,21 @@ def parser_gen():
         if args.k & (args.k - 1) != 0 or args.k <= 0:
             raise SystemExit(f"--k must be a power of 2 for {args.rslt_type} (Triton fold "
                              f"kernel constraint); got {args.k}.")
+
+    # gemm_bits (w) is an Ozaki-1 concept; w!=8 routes to the w-bit GEMM paths.
+    if args.ozaki_placement is not None and args.gemm_bits != 8:
+        if args.rslt_type not in ("ozaki1", "ozaki1_fp"):
+            raise SystemExit(f"--gemm_bits {args.gemm_bits} (w!=8) only applies to rslt_type "
+                             f"ozaki1 / ozaki1_fp; got {args.rslt_type}.")
+        if args.rslt_type == "ozaki1" and args.weight_cache:
+            raise SystemExit("--gemm_bits!=8 with rslt_type ozaki1 (int8 reference) has no "
+                             "weight_cache; drop --weight_cache, or use rslt_type ozaki1_fp.")
+
+    # byte_split_style (integer chunk method) is Ozaki-1 only; no_clamp needs the bf16 path.
+    if args.ozaki_placement is not None and args.byte_split_style == "all_signed_no_clamp" \
+            and args.rslt_type != "ozaki1_fp":
+        raise SystemExit("--byte_split_style all_signed_no_clamp is rslt_type ozaki1_fp only "
+                         "(the int8 path cannot represent the +-2^(w-1) MSB digit).")
 
     # force float16 for gptqmodel inference
     if "gptqmodel" in args.model:
@@ -267,11 +310,19 @@ def main(args):
                 "chunk_size": args.k,
                 "rslt_type": args.rslt_type,
                 "weight_cache": args.weight_cache,
+                # Ozaki-1 GEMM unit bit-width w (8 = int8 byte-split; 2/4 = w-bit). ozaki2 ignores it.
+                "gemm_bits": args.gemm_bits,
+                # Ozaki-1 integer digit-split (chunk) method. ozaki2 ignores it.
+                "byte_split_style": args.byte_split_style,
                 # Ozaki-2 (RNS) params; ignored by the ozaki1 types.
                 "s": args.s,
                 "scale_method": args.scale_method,
                 "shift_bits": args.shift_bits,
                 "M_frac_bits": args.M_frac_bits,
+                # Per-op overrides: nmp_overrides for ozaki1*, s_overrides for ozaki2*
+                # (the other is ignored by its scheme). {pattern: value} or None.
+                "nmp_overrides": args.nmp_overrides,
+                "s_overrides": args.s_overrides,
             },
         }
     if args.ozaki_placement is not None:
@@ -365,7 +416,9 @@ def main(args):
         from vllm_custom.model_executor.layers.ozaki_attention import install_ozaki_attention_backend
         install_ozaki_attention_backend(args.nmp, args.k, args.rslt_type,
                                         s=args.s, scale_method=args.scale_method,
-                                        shift_bits=args.shift_bits, M_frac_bits=args.M_frac_bits)
+                                        shift_bits=args.shift_bits, M_frac_bits=args.M_frac_bits,
+                                        gemm_bits=args.gemm_bits,
+                                        byte_split_style=args.byte_split_style)
 
     results, details = vllm(
         model_config=model_config,

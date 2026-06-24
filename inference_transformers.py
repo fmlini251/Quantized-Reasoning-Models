@@ -60,6 +60,15 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--nmp", type=int, default=1, choices=[1, 2, 3, 4, 6], help="ozaki1 nmp (int8 GEMM products)")
     p.add_argument("--rslt_type", type=str, default="ozaki1", choices=["ozaki1", "ozaki1_fp", "bf16"], help="ozaki matmul result type; 'bf16' = plain eager baseline (no ozaki)")
+    p.add_argument("--gemm_bits", "--w", type=int, default=8, choices=[2, 4, 8], dest="gemm_bits",
+                   help="ozaki1 GEMM unit bit-width w (int_bits=w*nD-1). 8=int8 byte-split / native "
+                        "fold; 2/4=w-bit paths (ozaki1 -> int8 reference w/o weight_cache, ozaki1_fp "
+                        "-> packed bf16). Ignored for bf16.")
+    p.add_argument("--byte_split_style", type=str, default="all_signed_clamp_pos",
+                   choices=["all_signed_clamp_pos", "all_signed_clamp", "all_signed_no_clamp"],
+                   help="ozaki1 integer digit-split (chunk) method: all_signed_clamp_pos (default, "
+                        "positive-only overflow prevention), all_signed_clamp (legacy abs-max), "
+                        "all_signed_no_clamp (MSB digit +-2^(w-1); rslt_type ozaki1_fp ONLY).")
     p.add_argument("--chunk_size", type=int, default=128, help="reduction-dim chunk size (ozaki k)")
     p.add_argument("--linear_only", action="store_true",
                    help="apply Ozaki only to nn.Linear (q/k/v/o_proj, mlp, lm_head); keep the "
@@ -100,7 +109,8 @@ def parse_args():
     return args
 
 
-def build_ozaki_configs(nmp, rslt_type="ozaki1", chunk_size=128):
+def build_ozaki_configs(nmp, rslt_type="ozaki1", chunk_size=128, gemm_bits=8,
+                        byte_split_style="all_signed_clamp_pos"):
     """CustomGemmConfig + GlobalOzaki1Config for a single ozaki1/ozaki1_fp GEMM with the
     given nmp, matching evaluate_ppl.py's --rslt_type <rslt_type> --nmp <nmp> --k <chunk_size>."""
     # emulation refactor (~2026-06): GlobalOzakiConfig -> GlobalOzaki1Config; the ozaki1
@@ -112,15 +122,22 @@ def build_ozaki_configs(nmp, rslt_type="ozaki1", chunk_size=128):
         in_feature_ts=4096, out_feature_ts=4096, chunk_size=chunk_size, name="",
         track_mtx_acc=False, track_model_acc=False, get_statistics=False, rslt_type=rslt_type,
     )
+    # gemm_bits (=w): 8 = int8 byte-split / native fold; 2/4 = w-bit paths. The int8 reference
+    # (rslt_type ozaki1) used for w!=8 has NO weight_cache, so disable it there; ozaki1_fp caches
+    # at any w.
+    use_weight_cache = not (rslt_type == "ozaki1" and gemm_bits != 8)
     oz = GlobalOzaki1Config(
         nmp_lst=[nmp], rounding="round_half_away_from_0",
-        weight_cache=True,  # cache preprocessed weights across decode steps
+        weight_cache=use_weight_cache,  # cache preprocessed weights across decode steps
+        gemm_bits=gemm_bits,
+        byte_split_style=byte_split_style,
     )
     return gcfg, oz
 
 
 def make_ozaki_model_class(nmp, rslt_type="ozaki1", chunk_size=128, sanitize_logits=True,
-                           linear_only=False, attn_impl="eager"):
+                           linear_only=False, attn_impl="eager", gemm_bits=8,
+                           byte_split_style="all_signed_clamp_pos"):
     from lighteval.models.transformers.transformers_model import TransformersModel
     from emulation.llm.ozaki_qwen import (
         prepare_qwen2_for_custom_matmul,
@@ -140,7 +157,7 @@ def make_ozaki_model_class(nmp, rslt_type="ozaki1", chunk_size=128, sanitize_log
             if rslt_type == "bf16":
                 return model  # plain bf16 baseline (no Ozaki emulation)
 
-            gcfg, oz = build_ozaki_configs(nmp, rslt_type, chunk_size)
+            gcfg, oz = build_ozaki_configs(nmp, rslt_type, chunk_size, gemm_bits, byte_split_style)
             if linear_only:
                 # Ozaki on every nn.Linear (q/k/v/o_proj, gate/up/down_proj, lm_head)
                 # ONLY; the attention score matmuls (QK^T / softmax / attn.V) stay in full
@@ -312,7 +329,9 @@ def main():
 
     OzakiModel = make_ozaki_model_class(args.nmp, args.rslt_type, args.chunk_size,
                                         sanitize_logits=not args.no_sanitize_logits,
-                                        linear_only=args.linear_only, attn_impl=args.attn_impl)
+                                        linear_only=args.linear_only, attn_impl=args.attn_impl,
+                                        gemm_bits=args.gemm_bits,
+                                        byte_split_style=args.byte_split_style)
     model = OzakiModel(env_config, model_config)
     model.generation_cap = args.max_new_tokens  # cap generated tokens (emulation is slow)
 

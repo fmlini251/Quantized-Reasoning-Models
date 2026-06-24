@@ -43,13 +43,18 @@ _OZAKI_ATTN_ANNOUNCED = False
 
 
 def set_ozaki_attention_params(nmp, chunk_size=32, rslt_type="ozaki1_fp", s=None,
-                               scale_method="new_compressed", shift_bits=7, M_frac_bits=8):
+                               scale_method="new_compressed", shift_bits=7, M_frac_bits=8,
+                               gemm_bits=8, byte_split_style="all_signed_clamp_pos"):
     global _OZAKI_ATTN_PARAMS
     _OZAKI_ATTN_PARAMS = {
         "nmp": int(nmp), "chunk_size": int(chunk_size), "rslt_type": rslt_type,
         # Ozaki-2 (RNS) params; only consumed for rslt_type ozaki2 / ozaki2_fp.
         "s": (int(s) if s is not None else None), "scale_method": scale_method,
         "shift_bits": int(shift_bits), "M_frac_bits": int(M_frac_bits),
+        # Ozaki-1 GEMM unit bit-width w (8 = int8 byte-split; 2/4 = w-bit emulation).
+        "gemm_bits": int(gemm_bits),
+        # Ozaki-1 integer digit-split (chunk) method.
+        "byte_split_style": byte_split_style,
     }
 
 
@@ -66,6 +71,8 @@ def _resolve_params():
         "scale_method": os.environ.get("OZAKI_ATTN_SCALE_METHOD", "new_compressed"),
         "shift_bits": int(os.environ.get("OZAKI_ATTN_SHIFT_BITS", "7")),
         "M_frac_bits": int(os.environ.get("OZAKI_ATTN_M_FRAC_BITS", "8")),
+        "gemm_bits": int(os.environ.get("OZAKI_ATTN_GEMM_BITS", "8")),
+        "byte_split_style": os.environ.get("OZAKI_ATTN_BYTE_SPLIT_STYLE", "all_signed_clamp_pos"),
     }
 
 
@@ -136,11 +143,13 @@ def _gather_kv_from_cache(key_cache, value_cache, block_table, seq_len, num_kv_h
 
 
 def install_ozaki_attention_backend(nmp=None, chunk_size=32, rslt_type="ozaki1_fp", s=None,
-                                    scale_method="new_compressed", shift_bits=7, M_frac_bits=8):
+                                    scale_method="new_compressed", shift_bits=7, M_frac_bits=8,
+                                    gemm_bits=8, byte_split_style="all_signed_clamp_pos"):
     """Monkeypatch vLLM's attention-backend selector to return OzakiAttentionBackend.
     Call BEFORE the LLM is built (attention layers resolve the backend at construction)."""
     if nmp is not None:
-        set_ozaki_attention_params(nmp, chunk_size, rslt_type, s, scale_method, shift_bits, M_frac_bits)
+        set_ozaki_attention_params(nmp, chunk_size, rslt_type, s, scale_method, shift_bits,
+                                   M_frac_bits, gemm_bits, byte_split_style)
         os.environ["OZAKI_ATTN_NMP"] = str(nmp)
         os.environ["OZAKI_ATTN_CHUNK"] = str(chunk_size)
         os.environ["OZAKI_ATTN_RSLT"] = rslt_type
@@ -149,6 +158,8 @@ def install_ozaki_attention_backend(nmp=None, chunk_size=32, rslt_type="ozaki1_f
         os.environ["OZAKI_ATTN_SCALE_METHOD"] = scale_method
         os.environ["OZAKI_ATTN_SHIFT_BITS"] = str(shift_bits)
         os.environ["OZAKI_ATTN_M_FRAC_BITS"] = str(M_frac_bits)
+        os.environ["OZAKI_ATTN_GEMM_BITS"] = str(gemm_bits)
+        os.environ["OZAKI_ATTN_BYTE_SPLIT_STYLE"] = byte_split_style
     os.environ["OZAKI_FULL_ATTENTION"] = "1"
 
     def _patched(*args, **kwargs):
@@ -201,7 +212,9 @@ class OzakiAttentionImpl(XFormersImpl):
             self._oz_gcfg, self._oz_oz = build_ozaki_configs(
                 p["nmp"], p["rslt_type"], p["chunk_size"],
                 s=p.get("s"), scale_method=p.get("scale_method", "new_compressed"),
-                shift_bits=p.get("shift_bits", 7), M_frac_bits=p.get("M_frac_bits", 8))
+                shift_bits=p.get("shift_bits", 7), M_frac_bits=p.get("M_frac_bits", 8),
+                gemm_bits=p.get("gemm_bits", 8),
+                byte_split_style=p.get("byte_split_style", "all_signed_clamp_pos"))
             global _OZAKI_ATTN_ANNOUNCED
             if not _OZAKI_ATTN_ANNOUNCED:
                 _OZAKI_ATTN_ANNOUNCED = True

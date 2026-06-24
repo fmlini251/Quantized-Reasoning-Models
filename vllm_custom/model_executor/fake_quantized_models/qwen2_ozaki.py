@@ -50,6 +50,11 @@ class Qwen2OzakiForCausalLM(Qwen2ForCausalLM):
         nmp = int(oz_cfg.get("nmp", 6))
         chunk_size = int(oz_cfg.get("chunk_size", 32))
         rslt_type = oz_cfg.get("rslt_type", "ozaki1_fp")
+        # GEMM unit bit-width w (ozaki1 only): 8 = int8 byte-split; 2/4 = w-bit emulation.
+        gemm_bits = int(oz_cfg.get("gemm_bits", 8))
+        # Integer digit-split (chunk) method (ozaki1 only): all_signed_clamp_pos (default) /
+        # all_signed_clamp / all_signed_no_clamp (ozaki1_fp only).
+        byte_split_style = oz_cfg.get("byte_split_style", "all_signed_clamp_pos")
         # weight_cache=False re-encodes the weight every forward instead of holding the ~3x
         # B_fold cache -> only 1x bf16 weight resident, so nmp=6 fits a single GPU.
         use_weight_cache = bool(oz_cfg.get("weight_cache", True))
@@ -60,6 +65,11 @@ class Qwen2OzakiForCausalLM(Qwen2ForCausalLM):
         scale_method = oz_cfg.get("scale_method", "new_compressed")
         shift_bits = int(oz_cfg.get("shift_bits", 7))
         m_frac_bits = int(oz_cfg.get("M_frac_bits", 8))
+        # Per-operation nmp/s overrides ({regex-pattern: value}); ozaki1 uses nmp_overrides,
+        # ozaki2 uses s_overrides (emulation feature). Patterns re.search-match the qualified
+        # layer name stored on each routed module below. None / {} -> uniform default.
+        nmp_overrides = oz_cfg.get("nmp_overrides", None)
+        s_overrides = oz_cfg.get("s_overrides", None)
 
         # Lazy import: pulls in the compiled `emulation` CUDA stack, which is only needed
         # when an Ozaki model is actually instantiated (not at registry-import time).
@@ -68,7 +78,9 @@ class Qwen2OzakiForCausalLM(Qwen2ForCausalLM):
 
         gcfg, oz = build_ozaki_configs(nmp, rslt_type, chunk_size, weight_cache=use_weight_cache,
                                        s=s, scale_method=scale_method, shift_bits=shift_bits,
-                                       M_frac_bits=m_frac_bits)
+                                       M_frac_bits=m_frac_bits,
+                                       nmp_overrides=nmp_overrides, s_overrides=s_overrides,
+                                       gemm_bits=gemm_bits, byte_split_style=byte_split_style)
         method = OzakiLinearMethod(gcfg, oz, use_weight_cache=use_weight_cache)
 
         n_routed = 0
@@ -79,10 +91,16 @@ class Qwen2OzakiForCausalLM(Qwen2ForCausalLM):
             if isinstance(module, LinearBase):
                 module.quant_method = method
                 module._ozaki_wc = None
+                # Stash the qualified name (e.g. model.layers.0.self_attn.qkv_proj) so the
+                # shared OzakiLinearMethod can label each GEMM for per-op override resolution.
+                module._ozaki_name = _name
                 n_routed += 1
 
         scheme_param = f"s={s}" if rslt_type in ("ozaki2", "ozaki", "ozaki2_fp") else f"nmp={nmp}"
+        ov = s_overrides if rslt_type in ("ozaki2", "ozaki", "ozaki2_fp") else nmp_overrides
+        ov_str = f", per-op overrides={ov}" if ov else ""
+        w_str = f", w={gemm_bits}" if gemm_bits != 8 else ""
         logger.info(
             "[Ozaki] linear-only: routed %d linear layers through ozaki "
-            "(rslt_type=%s, %s, chunk_size=%d, weight_cache=%s); attention + lm_head stay native.",
-            n_routed, rslt_type, scheme_param, chunk_size, use_weight_cache)
+            "(rslt_type=%s, %s%s, chunk_size=%d, weight_cache=%s%s); attention + lm_head stay native.",
+            n_routed, rslt_type, scheme_param, w_str, chunk_size, use_weight_cache, ov_str)

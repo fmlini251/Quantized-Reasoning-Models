@@ -1,0 +1,34 @@
+# Ozaki-1 fp on GSM8K via vLLM with a NARROW GEMM unit: w = 4 bits (gemm_bits: 4).
+#
+# w<8 routes the ozaki1_fp path to the packed w-bit bf16 emulation
+# (ozaki1_batched_gemm_fp -> _ozaki1_batched_gemm_fp_wbit): operands split into 4-bit digits,
+# the kept digit-pair region covered by the minimum signed g=8//w=2-bounded packed GEMMs.
+# Precision scales as int_bits = w*nD - 1, so w=4 needs a higher nmp than w=8 for the same
+# accuracy (e.g. w=4 nmp=4 == w=8 nmp=1; here nmp=6 -> nD=3, int_bits=11).
+#
+# Run (single GPU):
+#   CUDA_VISIBLE_DEVICES=<free_gpu> conda run -n quantized-reasoning-models \
+#       python inference_vllm.py --config configs/ozaki1_fp_w4_gsm8k.yaml
+# For w=2 set gemm_bits: 2 (use a still-higher nmp, e.g. 9/10, for usable precision).
+
+# --- model / dataset ---
+model: ./modelzoo/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
+dataset: GSM8K
+
+# --- Ozaki emulation ---
+ozaki_placement: linear_only   # w!=8 supported on linear (and full); ozaki on nn.Linear here
+rslt_type: ozaki1_fp           # block-FP polynomial fp emulation (w-bit path supports weight_cache)
+nmp: 6                         # valid w-bit nmp: 1/3/4/6/9/10/15/16
+gemm_bits: 4                   # GEMM unit width w = 4 bits (8 = int8 byte-split default)
+byte_split_style: all_signed_clamp_pos   # integer chunk method (default). also: all_signed_clamp /
+#                              #   all_signed_no_clamp (MSB digit +-2^(w-1); ozaki1_fp only).
+k: 32                          # reduction-dim chunk size
+weight_cache: false            # re-encode each forward (1x weight resident, single-GPU safe).
+#                              # nmp=6's cached encoding is ~3x weights -> set true only with TP=2.
+
+# --- generation (paper settings; also the inference_vllm.py defaults) ---
+temperature: 0.6
+top_p: 0.95
+seed: 42
+max_new_tokens: 32768
+max_model_length: 32768

@@ -1,0 +1,43 @@
+# Ozaki-2 fp (RNS / CRT bf16 byte-plane emulation) on GSM8K via vLLM,
+# with PER-OPERATION s overrides -- the emulation `s_overrides` feature
+# (the ozaki2 analogue of nmp_overrides), ported to the vLLM inference path.
+#
+# Run (single GPU):
+#   CUDA_VISIBLE_DEVICES=<free_gpu> conda run -n quantized-reasoning-models \
+#       python inference_vllm.py --config configs/ozaki2_fp_per_op_gsm8k.yaml
+#
+# Equivalent CLI: ... --s 3 --s_overrides qkv_proj=2,down_proj=4
+# Any field here can be overridden on the CLI (precedence: CLI > YAML > default).
+
+# --- model / dataset ---
+model: ./modelzoo/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
+dataset: GSM8K
+
+# --- Ozaki emulation ---
+ozaki_placement: linear_only   # overrides match LINEAR layer names, so use linear_only (or full)
+rslt_type: ozaki2_fp           # RNS / CRT fp byte-plane emulation (the validated method)
+s: 3                           # DEFAULT RNS modulus count for any op not matched below (valid 2..20)
+k: 64                          # reduction-dim chunk size (power of 2 for the Triton fold kernel)
+scale_method: new_compressed
+shift_bits: 7
+M_frac_bits: 8
+weight_cache: true             # cache the byte-plane encoded weights (per-layer, override-aware)
+
+# Per-operation s overrides: {regex-pattern: s}. Each pattern re.search-matches the qualified
+# layer name; the FIRST match wins, else the default `s` above. Here the attention projections
+# run at s 2 (cheaper) and the MLP down_proj at s 4 (more accurate); everything else keeps s 3.
+# All override s values are auto-registered alongside the default so their RNS tables are built.
+#
+# IMPORTANT (vLLM layer fusion): vLLM fuses q/k/v -> `qkv_proj` and gate/up -> `gate_up_proj`,
+# so the matchable linear names are: qkv_proj, o_proj, gate_up_proj, down_proj (+ `layers.<i>`).
+# The transformers-side q_proj / k_proj patterns do NOT exist here.
+s_overrides:
+  qkv_proj: 2
+  down_proj: 4
+
+# --- generation (paper settings; also the inference_vllm.py defaults) ---
+temperature: 0.6
+top_p: 0.95
+seed: 42
+max_new_tokens: 32768
+max_model_length: 32768

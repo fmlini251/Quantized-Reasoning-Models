@@ -1,0 +1,47 @@
+# Ozaki-1 fp (block-FP polynomial bf16 emulation) on GSM8K via vLLM,
+# with PER-OPERATION nmp overrides -- the emulation `nmp_overrides` feature
+# (emulation/llm/configs/ozaki1_per_op.yaml), ported to the vLLM inference path.
+#
+# Run (single GPU):
+#   CUDA_VISIBLE_DEVICES=<free_gpu> conda run -n quantized-reasoning-models \
+#       python inference_vllm.py --config configs/ozaki1_fp_per_op_gsm8k.yaml
+#
+# Equivalent CLI: ... --nmp 6 --nmp_overrides qkv_proj=1,o_proj=3
+# Any field here can be overridden on the CLI (precedence: CLI > YAML > default).
+
+# --- model / dataset ---
+model: ./modelzoo/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
+dataset: GSM8K
+
+# --- Ozaki emulation ---
+ozaki_placement: linear_only   # overrides match LINEAR layer names, so use linear_only (or full)
+rslt_type: ozaki1_fp           # block-FP polynomial fp emulation
+nmp: 6                         # DEFAULT block-FP GEMM count for any op not matched below
+gemm_bits: 8                   # GEMM unit width w. 8 = int8 byte-split (native fold; nmp 1/3/4/6).
+#                              # 2/4 = w-bit emulation -> valid nmp 1/3/4/6/9/10/15/16
+#                              # (e.g. w=4 nmp=4 == w=8 nmp=1). w only applies to ozaki1*.
+byte_split_style: all_signed_clamp_pos   # integer chunk method (default). other choices:
+#                              #   all_signed_clamp (legacy abs-max) / all_signed_no_clamp
+#                              #   (MSB digit +-2^(w-1); ozaki1_fp only).
+k: 32                          # reduction-dim chunk size
+weight_cache: true             # cache the block-FP encoded weights (per-layer, override-aware)
+
+# Per-operation nmp overrides: {regex-pattern: nmp}. Each pattern re.search-matches the
+# qualified layer name (e.g. model.layers.0.self_attn.qkv_proj); the FIRST match wins, else
+# the default `nmp` above. Here the attention projections run at nmp 1 and the attention
+# output at nmp 3, while the MLP (gate_up_proj / down_proj) keeps the default nmp 6.
+#
+# IMPORTANT (vLLM layer fusion): vLLM fuses q/k/v -> `qkv_proj` and gate/up -> `gate_up_proj`,
+# so the matchable linear names are: qkv_proj, o_proj, gate_up_proj, down_proj (+ `layers.<i>`
+# to target one decoder layer). The transformers-side q_proj / k_proj patterns do NOT exist
+# here -- one fused qkv_proj GEMM cannot use different nmp for q vs k.
+nmp_overrides:
+  qkv_proj: 1
+  o_proj: 3
+
+# --- generation (paper settings; also the inference_vllm.py defaults) ---
+temperature: 0.6
+top_p: 0.95
+seed: 42
+max_new_tokens: 32768
+max_model_length: 32768

@@ -1,8 +1,8 @@
-# Ozaki-2 fp (RNS / CRT bf16 byte-plane emulation) on GSM8K via vLLM.
+# Ozaki-2 fp (RNS / CRT bf16 byte-plane emulation) on MATH-500 via vLLM.
 #
 # Run (single GPU):
 #   CUDA_VISIBLE_DEVICES=<free_gpu> conda run -n quantized-reasoning-models \
-#       python inference_vllm.py --config configs/ozaki2_fp_gsm8k.yaml
+#       python inference_vllm.py --config configs/ozaki2_fp_MATH_500.yaml
 #
 # Any field here can be overridden on the CLI (precedence: CLI > YAML > default).
 # Keys are the inference_vllm.py long flag names without the leading '--'.
