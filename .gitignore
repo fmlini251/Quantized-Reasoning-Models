@@ -6,3 +6,6 @@ datasets*
 *experiments*
 tmp/
 sparse_logs/
+logs/
+*.swp
+.*.swp
