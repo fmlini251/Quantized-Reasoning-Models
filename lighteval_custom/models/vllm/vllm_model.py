@@ -97,6 +97,9 @@ class VLLMModelConfig:
     enable_prefix_caching: bool = None
     enable_chunked_prefill: bool = None
     init_model: bool = None
+    hf_overrides: Optional[dict] = None  # forwarded to vLLM (e.g. to override architectures + inject ozaki_config)
+    max_num_batched_tokens: Optional[int] = None  # cap per-step token batch (bounds ozaki intermediate memory)
+    max_num_seqs: Optional[int] = None  # cap concurrent sequences (bounds decode-batch ozaki memory)
 
     subfolder: Optional[str] = None
 
@@ -189,6 +192,12 @@ class VLLMModel(LightevalModel):
             "enable_prefix_caching": config.enable_prefix_caching,
             "enable_chunked_prefill": config.enable_chunked_prefill,
         }
+        if config.hf_overrides is not None:
+            self.model_args["hf_overrides"] = config.hf_overrides
+        if config.max_num_batched_tokens is not None:
+            self.model_args["max_num_batched_tokens"] = int(config.max_num_batched_tokens)
+        if config.max_num_seqs is not None:
+            self.model_args["max_num_seqs"] = int(config.max_num_seqs)
         if int(config.data_parallel_size) > 1:
             self.model_args["distributed_executor_backend"] = "ray"
             self._batch_size = "auto"

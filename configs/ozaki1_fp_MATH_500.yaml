@@ -1,0 +1,28 @@
+# Ozaki-1 fp (block-FP polynomial bf16 emulation) on GSM8K via vLLM.
+#
+# Run (single GPU):
+#   CUDA_VISIBLE_DEVICES=<free_gpu> conda run -n quantized-reasoning-models \
+#       python inference_vllm.py --config configs/ozaki1_fp_gsm8k.yaml
+#
+# Any field here can be overridden on the CLI (precedence: CLI > YAML > default).
+# Keys are the inference_vllm.py long flag names without the leading '--'.
+
+# --- model / dataset ---
+model: ./modelzoo/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
+dataset: MATH-500
+
+# --- Ozaki emulation ---
+ozaki_placement: full   # ozaki on nn.Linear only; attention stays native (the fast path)
+rslt_type: ozaki1_fp           # block-FP polynomial fp emulation
+nmp: 1                         # block-FP GEMM count (1/3/4/6; higher = more accurate, slower)
+k: 32                          # reduction-dim chunk size
+weight_cache: true           # default on = cache the block-FP encoded weights (single-GPU safe).
+#                              # set true for speed; nmp=6 cache needs ~3x weight memory -> use 2 GPUs (TP=2).
+# (s / scale_method / shift_bits / M_frac_bits / combine_fp64 are Ozaki-2 only -- ignored here.)
+
+# --- generation (paper settings; also the inference_vllm.py defaults) ---
+temperature: 0.6
+top_p: 0.95
+seed: 42
+max_new_tokens: 32768
+max_model_length: 32768

@@ -9,6 +9,7 @@ from vllm_custom.model_executor.fake_quantized_models.qwen2_flatquant import Qwe
 from vllm_custom.model_executor.fake_quantized_models.qwen2_kvquant_star import Qwen2KVQuantStarForCausalLM
 from vllm_custom.model_executor.fake_quantized_models.qwen2_quarot_kv import Qwen2QuaRotKVForCausalLM
 from vllm_custom.model_executor.fake_quantized_models.qwen2_quarot import Qwen2QuaRotForCausalLM
+from vllm_custom.model_executor.fake_quantized_models.qwen2_ozaki import Qwen2OzakiForCausalLM
 
 
 def register_fake_quantized_models():
@@ -22,3 +23,4 @@ def register_fake_quantized_models():
     ModelRegistry.register_model("Qwen2KVQuantStarForCausalLM", Qwen2KVQuantStarForCausalLM)
     ModelRegistry.register_model("Qwen2QuaRotKVForCausalLM", Qwen2QuaRotKVForCausalLM)
     ModelRegistry.register_model("Qwen2QuaRotForCausalLM", Qwen2QuaRotForCausalLM)
+    ModelRegistry.register_model("Qwen2OzakiForCausalLM", Qwen2OzakiForCausalLM)

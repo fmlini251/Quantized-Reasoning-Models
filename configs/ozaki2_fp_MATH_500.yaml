@@ -1,0 +1,31 @@
+# Ozaki-2 fp (RNS / CRT bf16 byte-plane emulation) on GSM8K via vLLM.
+#
+# Run (single GPU):
+#   CUDA_VISIBLE_DEVICES=<free_gpu> conda run -n quantized-reasoning-models \
+#       python inference_vllm.py --config configs/ozaki2_fp_gsm8k.yaml
+#
+# Any field here can be overridden on the CLI (precedence: CLI > YAML > default).
+# Keys are the inference_vllm.py long flag names without the leading '--'.
+
+# --- model / dataset ---
+model: ./modelzoo/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
+dataset: MATH-500
+
+# --- Ozaki emulation ---
+ozaki_placement: linear_only
+rslt_type: ozaki2_fp           # RNS / CRT fp byte-plane emulation (the validated method)
+s: 2                           # RNS modulus count (valid 2..20; higher = more accurate, slower)
+k: 64                          # reduction-dim chunk size
+scale_method: new_compressed
+shift_bits: 7
+M_frac_bits: 8
+weight_cache: true           # default on = cache the block-FP encoded weights (single-GPU safe).
+#                              # set true for speed, but it needs ~3-4x weight memory -> use 2 GPUs (TP=2).
+# combine_fp64: false          # default fp32 accumulation (faster). set true for the fp64 ppl baseline.
+
+# --- generation (paper settings; also the inference_vllm.py defaults) ---
+temperature: 0.6
+top_p: 0.95
+seed: 42
+max_new_tokens: 32768
+max_model_length: 32768
