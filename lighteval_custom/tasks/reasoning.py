@@ -69,7 +69,7 @@ def prompt_fn(line, task_name: str = None):
     """Assumes the model is either prompted to emit \\boxed{answer} or does so automatically"""
     return Doc(
         task_name=task_name,
-        query=f"{line["problem"]}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}.",
+        query=f"{line['problem']}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}.",
         choices=[line["solution"]],
         gold_index=0,
     )
@@ -78,7 +78,7 @@ def prompt_fn(line, task_name: str = None):
 def aime24_prompt_fn(line, task_name: str = None):
     return Doc(
         task_name=task_name,
-        query=f"{line["Problem"]}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}.",
+        query=f"{line['Problem']}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}.",
         choices=[line["Answer"]],
         gold_index=0,
     )
@@ -87,7 +87,7 @@ def aime24_prompt_fn(line, task_name: str = None):
 def aime25_prompt_fn(line, task_name: str = None):
     return Doc(
         task_name=task_name,
-        query=f"{line["problem"]}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}.",
+        query=f"{line['problem']}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}.",
         choices=[line["answer"]],
         gold_index=0,
     )
@@ -96,7 +96,7 @@ def aime25_prompt_fn(line, task_name: str = None):
 def gsm8k_prompt_fn(line, task_name: str = None):
     return Doc(
         task_name=task_name,
-        query=f"{line["question"]}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}.",
+        query=f"{line['question']}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}.",
         choices=[line["answer"]],
         gold_index=0,
     )
