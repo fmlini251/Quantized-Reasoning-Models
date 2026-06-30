@@ -98,6 +98,18 @@ def _pad_reduction_to_chunk(A, B, chunk_size):
             torch.nn.functional.pad(B, (0, 0, 0, pad)))
 
 
+def _attn_product(A, B, cfg, oz, out_dtype):
+    """The QK^T / PV batched product. When env OZAKI_ATTN_EXACT=1, compute it as an EXACT bf16
+    torch.matmul (NO Ozaki quantization) -- this isolates the eager backend's implementation
+    gap vs native FlashAttention (the EAGER-EXACT control). Otherwise the normal Ozaki block-FP
+    batched_gemm. The exact branch's zero-padded reduction dim is numerically a no-op, so the
+    eager path is otherwise byte-identical between the two modes."""
+    if os.environ.get("OZAKI_ATTN_EXACT", "0") == "1":
+        return torch.matmul(A, B).to(out_dtype)
+    from emulation.llm.ozaki_matmul import batched_gemm
+    return batched_gemm(A, B, custom_gemm_config=cfg, ozaki_config=oz, out_dtype=out_dtype)
+
+
 def _ozaki_eager_attention(query, key, value, scaling, gcfg, oz, base_name):
     """query/key/value: [n, q_len, head_dim] / [n, kv_len, head_dim] (n = batch*heads,
     KV already repeated to n). Causal mask is applied by the callers via the q/kv length
@@ -105,25 +117,21 @@ def _ozaki_eager_attention(query, key, value, scaling, gcfg, oz, base_name):
     Returns [n, q_len, head_dim]. Mirrors custom_qwen2_eager_attention_forward's two
     batched_gemm calls + fp32 softmax."""
     import copy
-    from emulation.llm.ozaki_matmul import batched_gemm
 
     qk_cfg = copy.copy(gcfg); qk_cfg.name = base_name + ".attn_weights"
     # QK^T reduction = head_dim (normally a power of two >= chunk_size, so a no-op); padded
     # defensively for chunk_size > head_dim.
     A, B = _pad_reduction_to_chunk(query, key.transpose(1, 2), gcfg.chunk_size)
-    attn = batched_gemm(A, B, custom_gemm_config=qk_cfg,
-                        ozaki_config=oz, out_dtype=query.dtype).to(query.dtype) * scaling
+    attn = _attn_product(A, B, qk_cfg, oz, query.dtype).to(query.dtype) * scaling
     return attn  # caller adds mask + softmax, then calls _ozaki_pv
 
 
 def _ozaki_pv(attn_weights, value, gcfg, oz, base_name):
     import copy
-    from emulation.llm.ozaki_matmul import batched_gemm
     pv_cfg = copy.copy(gcfg); pv_cfg.name = base_name + ".attn_output"
     # PV reduction = kv_len, which can be a small non-power-of-two -> pad up to chunk_size.
     aw, v = _pad_reduction_to_chunk(attn_weights, value, gcfg.chunk_size)
-    return batched_gemm(aw, v, custom_gemm_config=pv_cfg,
-                        ozaki_config=oz, out_dtype=attn_weights.dtype).to(attn_weights.dtype)
+    return _attn_product(aw, v, pv_cfg, oz, attn_weights.dtype).to(attn_weights.dtype)
 
 
 def _gather_kv_from_cache(key_cache, value_cache, block_table, seq_len, num_kv_heads, head_size):
