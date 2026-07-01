@@ -149,35 +149,38 @@ slot-cuBLAS. flash_ozaki가 어텐션 전용인 이유.
 ozaki w4 nmp10, **chunk=32**. flash-exact = 같은 커널 `ozaki=False`(순수 bf16) 경로.
 
 ### B.1 정확도 (fp32 exact 대비, chunk=32)
-| case | flash-ozaki (bf16 out) | flash-exact (bf16) | torch SDPA (bf16) | prod-EAGER (fp32) | prod-FLASH (fp32) |
+| case | flash-ozaki (bf16) | flash-exact (bf16) | torch SDPA (bf16) | prod-FLASH P-bf16 (fp32 out) | prod-FLASH P-fp32 (fp32 out) |
 |---|---|---|---|---|---|
-| PREFILL MHA N=1024 | **1.61e-3** | 1.99e-3 | 1.99e-3 | 1.66e-4 | 1.96e-4 |
-| DECODE GQA B=32 N=2048 | **1.68e-3** | 2.25e-3 | 2.25e-3 | — | — |
+| PREFILL MHA N=1024 | **1.99e-3** | 1.99e-3 | 1.99e-3 | 1.19e-3 | 1.96e-4 |
+| DECODE GQA B=32 N=2048 | **2.28e-3** | 2.26e-3 | 2.25e-3 | — | — |
 
-- flash-ozaki(nmp10)는 **순수 bf16 어텐션(SDPA/flash-exact)만큼 — 오히려 약간 더 — 정확**하다. (P를 fp32로
-  유지한 채 block-FP 인코딩하므로, P를 bf16으로 truncate하는 SDPA/flash-exact보다 낫다.)
-- prod-EAGER/FLASH = **production `ozaki1_batched_gemm_fp`** 로 QK·PV를 돌린 torch 어텐션. EAGER는 전체 S를
-  materialize→전체행 fp32 softmax→PV, FLASH는 online-softmax(BN=32 타일별 QK/PV, P를 fp32 유지). 둘 다
-  **fp32를 반환**한다.
+- flash-ozaki(nmp10)는 **순수 bf16 어텐션(SDPA/flash-exact)과 정확도 동일**하다. ozaki 양자화가 추가하는
+  오차는 무시할 수준(bf16 아래).
+- **정밀도 모델(모든 bf16 flash-attention 공통):** score(QK)·softmax 통계(m/l)·`l` 정규화자·accumulator는
+  **전부 fp32**. **P(=softmax 확률)만 P@V matmul 직전에 bf16으로 truncate**하고(텐서코어가 bf16 피연산자를
+  요구), 최종 출력도 bf16 저장. score→softmax 사이 bf16 캐스트는 **없다**.
+  - flash-exact: `tl.dot(p.to(v.dtype), v)` — v가 bf16이라 P를 bf16 캐스트.
+  - SDPA: FlashAttention의 텐서코어 P@V가 P를 입력 dtype(bf16)으로 캐스트.
+  - **flash-ozaki: `p = p.to(tl.bfloat16)` 후 block-FP PV 인코딩** (l 정규화자는 fp32 유지). 세 경로가 동일.
+- prod-FLASH = **production `ozaki1_batched_gemm_fp`** 로 per-tile QK/PV를 돌린 online-softmax torch 어텐션.
+  fp32를 반환하므로 fp32-exact 대비 값이 flash-ozaki보다 작아 보이지만, 이는 **출력 dtype 차이**일 뿐이다.
 
-> **핵심(정정): flash-ozaki의 "1.6e-3"은 >99%가 bf16 출력 반올림이지 ozaki·flash 알고리즘 오차가 아니다.**
-> - score(QK)·softmax 통계(m/l)·accumulator는 flash-ozaki도 **전부 fp32**다(SDPA·Triton flash와 동일). bf16은
->   **최종 출력 저장**(`acc.to(Out.dtype)`) 한 곳뿐이며, bf16 모델의 정상 동작이다.
-> - 증거: **SDPA도 bf16 입력→bf16 출력(정상 사용법)이면 fp32-exact 대비 1.99e-3**, fp32로 돌리면 **3.4e-7**.
->   flash-ozaki 출력을 fp32로 두면(=codegen twin 에뮬) 실제 ozaki 오차는 **~2e-4**로, prod-FLASH(1.96e-4)와
->   일치한다. `emul(codegen twin)→bf16` 은 flash-ozaki와 **relerr까지 bit-일치**(1.534e-3=1.534e-3).
+> **핵심: flash-ozaki의 "2e-3 (vs fp32-exact)"는 ozaki·flash 알고리즘 오차가 아니라 bf16(출력 + P) 반올림이다.**
+> - 증거: **SDPA도 bf16 입력→bf16 출력(정상 사용법)이면 1.99e-3**, fp32로 돌리면 **3.4e-7**. 같은 알고리즘,
+>   출력 dtype만 다르다. prod-FLASH(P fp32, fp32 out)의 실제 ozaki 오차는 **~2e-4**, P를 bf16으로 truncate하면
+>   (fp32 out) 1.19e-3, 여기에 bf16 출력까지 더하면 flash-ozaki의 1.99e-3이 된다.
 > - GEMM 단독 검증: codegen QK/PV는 production `ozaki1_batched_gemm_fp`와 **relerr=0.0(bit-identical)**.
 
-**flash-ozaki는 production-based EAGER보다 production-based FLASH 에뮬레이션에 훨씬 가깝다** (출력 정밀도를 bf16로 맞춰 측정):
+**flash-ozaki는 production-based EAGER보다 production-based FLASH 에뮬레이션에 훨씬 가깝다** (출력·P 정밀도를 동일하게 bf16으로 맞춰 측정):
 
-| flash-ozaki 까지의 거리 (bf16 출력 일치) | relerr |
+| flash-ozaki 까지의 거리 (bf16 출력·P 일치) | relerr |
 |---|---|
-| ↔ **prod-FLASH**→bf16 (online softmax, 동일 구조) | **3.2e-5** |
-| ↔ **prod-EAGER**→bf16 (materialized full-row softmax) | 8.5e-4 |
+| ↔ **prod-FLASH** (P→bf16, online softmax, 동일 구조) | **3.1e-5** |
+| ↔ **prod-EAGER** (P→bf16, materialized full-row softmax) | 2.9e-3 |
 
-online-softmax flash 알고리즘을 production ozaki GEMM으로 **충실히 구현**했음을 확인(FLASH에 ~26× 더 가까움).
-eager와의 8.5e-4 차이는 알고리즘 차이(전체행 정규화 P vs per-tile 비정규화 P). fp32로 보면 두 거리가
-1.60e-3≈1.62e-3로 구분 안 되는데, 이는 flash-ozaki의 bf16 출력 반올림(~1.6e-3)이 3e-5 신호를 덮기 때문.
+online-softmax flash 알고리즘을 production ozaki GEMM으로 **충실히 구현**(FLASH에 ~92× 더 가까움)했으며,
+P→bf16 truncation·bf16 출력까지 real flash-attention 데이터패스와 정확히 일치. eager와의 거리(2.9e-3)는
+알고리즘 차이(전체행 정규화 P vs per-tile 비정규화 P)다.
 
 ### B.2 지연 (ms/call, chunk=32) — **non-cached flash 속도**
 | case | flash-ozaki | flash-exact | torch SDPA | oz/sdpa |
@@ -375,8 +378,10 @@ per-step(append 91 + cached-attn 590 = 682µs)이 naive(757µs)를 **1.11× 이�
 ## 핵심 결론
 1. **Faithful (chunk=32)**: 역양자화 피연산자는 production과 **비트동일**, 출력은 **fp32 누산 바닥**까지 일치
    (정확도 `== production`). int8-HW 자릿수 범위도 지켜진다.
-2. **어텐션 정확도**: flash-ozaki(nmp10, chunk=32)는 bf16 SDPA만큼(약간 더) 정확. **Decode(GQA)에선 SDPA보다
-   빠르고**(~3.2×), prefill은 int8 재현 비용으로 SDPA의 ~13~17×.
+2. **어텐션 정확도**: flash-ozaki(nmp10, chunk=32)는 bf16 SDPA/flash-exact와 **동일**(1.99e-3, vs fp32-exact).
+   이 값은 bf16(출력+P) 반올림이지 ozaki 오차가 아니다(SDPA도 bf16이면 1.99e-3, fp32면 3.4e-7). score/softmax/
+   정규화자는 fp32, P는 P@V 직전 bf16 truncate — SDPA·flash-exact와 동일한 데이터패스. **Decode(GQA)에선
+   SDPA보다 빠르고**(~3.2×), prefill은 int8 재현 비용으로 SDPA의 ~13~17×.
 3. **chunk=32 통일**: 모든 리덕션(QK head_dim·PV kv·독립 GEMM K)을 production과 같은 32로 청크 — 더 faithful
    하고 chunk=None보다 빠르다. cached 경로도 동일 지원(cached vs non-cached: chunk=32 prefill은 fp-순서 ~6e-6,
    chunk=None/decode는 비트동일).

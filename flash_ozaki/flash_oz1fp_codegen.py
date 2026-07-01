@@ -258,7 +258,8 @@ def _gen_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
         l_i = l_i * alpha + tl.sum(p, axis=1)
         v = tl.load(V + pid_z * svz + offn[:, None] * svn + offd[None, :] * svd,
                     mask=nmask[:, None] & dmask[None, :], other=0.0)
-        psc = _bfp_scale(tl.max(p, axis=1), {ib_pv})
+        p = p.to(tl.bfloat16)                     # P->bf16 for P@V (matches SDPA/flash-exact); l_i normalizer stays fp32
+        psc = _bfp_scale(tl.max(p, axis=1).to(tl.float32), {ib_pv})
         vsc = _bfp_scale(tl.max(tl.abs(v), axis=0).to(tl.float32), {ib_pv})
         pI = (p / psc[:, None] + 0.5).to(tl.int32)
         pI = tl.minimum(pI, {hi_pv})
@@ -487,7 +488,8 @@ def _gen_cached_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
         p = tl.exp(qk - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
         vsc = tl.load(Vs + pid_z * svsz + (n0 // BLOCK_N) * svsc + offd * svsd, mask=dmask, other=0.0)
-        psc = _bfp_scale(tl.max(p, axis=1), {ib_pv})
+        p = p.to(tl.bfloat16)                     # P->bf16 for P@V (matches SDPA/flash-exact); l_i normalizer stays fp32
+        psc = _bfp_scale(tl.max(p, axis=1).to(tl.float32), {ib_pv})
         pI = (p / psc[:, None] + 0.5).to(tl.int32)
         pI = tl.minimum(pI, {hi_pv})
 {_emit_peel("pp", "pI", w_pv, nD_pv, no_clamp, L)}
