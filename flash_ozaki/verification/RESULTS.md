@@ -160,9 +160,16 @@ flash-ozaki(nmp10)는 **순수 bf16 어텐션(SDPA/flash-exact)만큼 — 오히
 
 셋 다 faithfulness 유지(Â bit-identical)이나 이득 없음 → **인코딩 비용은 개별 산술/리덕션이 아니라 구조적**
 (Q/K/P/V 4개 피연산자의 메모리 트래픽 + int↔bf16 캐스트 + occupancy)이다. Triton/ptxas가 나눗셈/exp2를 이미
-최적화하고, 리덕션도 병목이 아니라 op 하나 빼도 안 변함. **실효 레버**: ① K/V 캐싱(구현됨, 4개 중 2개 인코딩을
-루프에서 제거, ~1.3×) — 유일하게 검증된 방법; ② occupancy 오토튜닝(num_warps/stages/BLOCK, Part C에서 속도를
-지배); ③ 근본적으론 HW int8 데이터패스(에뮬 대상)나 더 거친 인코딩(faithfulness 희생)만 큰 이득.
+최적화하고, 리덕션도 병목이 아니라 op 하나 빼도 안 변함.
+
+**occupancy 오토튜닝도 실측 — 무의미:** num_warps×num_stages×BLOCK_M 스윕(prefill nmp10: 3×3×4=36 config,
+decode nmp10: 32 config). prefill 최적 = default 대비 **1.02×**(nw4/ns1/bm64가 이미 rank-3), decode = **1.00×**
+(default가 최적). 즉 커널은 **이미 near-optimal**하게 튜닝돼 있고 ~8×(prefill)/~5×(decode) 오버헤드는 구현
+비효율이 아니라 **ozaki 에뮬레이션의 본질적 비용**(다중 자릿수 dot + 타일별 4-피연산자 인코딩)이다.
+
+**결론 — 실효 레버는 사실상 하나:** ① **K/V 캐싱**(구현됨, 4개 중 2개 인코딩을 루프에서 제거, ~1.3×) — 검증된
+유일한 방법. ② op-튜닝/오토튜닝은 exhausted(무효). ③ 큰 이득은 근본적으로 **HW int8 데이터패스**(에뮬 대상)나
+**더 거친/적은 인코딩**(faithfulness 희생)뿐.
 
 ---
 
