@@ -213,7 +213,24 @@ K head_dim을 chunk별로 스케일(k_scale `[Z,nchd,N]`), V kv를 chunk로 나�
 Decode(chunk=32): MHA 1.92e-3, GQA(4 kv헤드, G=7 fold) 1.87e-3 (vs EXACT). **캐시가 모든 config에서
 non-cached보다 빠르다**(타일별 K/V 인코딩 제거; chunk=32는 BLOCK_N=32라 공유메모리 여유가 있어 OOM 재시도도 없음).
 
-### E.2 cached vs non-cached = ~1e-5는 **순수 fp 누산 순서**(값 차이 아님) 확인
+### E.2 캐시 이득은 prefill·decode 모두 ~1.3× (production의 "decode에서 큰 이득"과 다른 이유)
+`nc/c` = non-cached(매 호출 전체 K/V 재인코딩) / cached(사전 인코딩) 지연 비.
+
+| regime | w4 nmp9 nc/c | w4 nmp10 nc/c |
+|---|---|---|
+| PREFILL MHA N=2048 | 1.30× | 1.27× |
+| DECODE GQA B=32 N=2048 | 1.29× | 1.28× |
+
+production(`ozaki1_fp_speed.md`)은 **decode 캐시 이득이 큼**(w4 nmp10 decode 18.1×→5.1×, ~3.5×) / prefill은
+작음(6.5×→5.6×). 우리는 두 regime 모두 ~1.3×로 **평탄**한데, 이유는 **캐시 대상이 다르기 때문**:
+- production `weight_cache`는 **정적 weight**(K×N, 매 step 동일)를 **전체 추론에서 1회** 인코딩→모든 토큰 재사용.
+  non-cached decode는 매 M=1 GEMV(50µs)마다 거대한 weight(4096²)를 재인코딩→인코딩≫GEMV→decode 이득 큼.
+- 우리 attention KV 캐시는 **동적**(decode마다 새 토큰 K/V가 append)이고, 인코딩이 커널에 **융합돼 저렴**(호출당
+  ~22–28%). 그래서 전체 재인코딩을 캐시로 없애도 ~1.3×.
+- production식 decode 대박 이득을 보려면 **증분 인코딩**(새 토큰 K/V만 O(D) 인코딩해 캐시에 append, 과거 재사용)이
+  필요 — 현 bench는 매 호출 전체 N개를 재인코딩하므로 그 이득을 측정하지 않는다(실서빙 KV-cache는 증분).
+
+### E.3 cached vs non-cached = ~1e-5는 **순수 fp 누산 순서**(값 차이 아님) 확인
 - 인코딩은 비트동일 — GEMM에서 `cached==fresh`가 w4 nmp10 chunk=32에서 `0.00e+00`; non-cached 커널에 raw K를
   넣든 캐시를 역양자화한 K를 넣든 출력이 `0.00e+00`(재인코딩 idempotent).
 - 두 커널 모두 결정적(각자 2회 = `0.00e+00`), `num_warps` 4↔8도 `0.00e+00`.
