@@ -149,8 +149,13 @@ flash-ozaki(nmp10)는 **순수 bf16 어텐션(SDPA/flash-exact)만큼 — 오히
 3. **chunk=32가 Q/K를 head_dim 청크별로 재인코딩**해 인코딩 증폭. 단 chunk=None은 nD≥4에서 OOM 재시도로
    **97.6×**(Part C) — chunk=32가 정답.
 
-본질적으로 int8 ozaki 수치를 SW로 재현하는 비용(HW int8 데이터패스 대체). 개선 레버: `a/scale`(2^k)을 역수
-곱/지수 시프트로, 인코딩 중복 축소.
+본질적으로 int8 ozaki 수치를 SW로 재현하는 비용(HW int8 데이터패스 대체).
+
+**시도했다 기각한 레버 — `a/scale` → 역수 곱:** scale이 2^k라 `a*(1/scale)`은 bit-exact(faithfulness 유지 확인).
+그러나 **속도 개선 없음**(GEMM 0.314→0.309, prefill nmp10 8.0×→7.9×, 노이즈 수준) → 원복. 이유: Triton/ptxas가
+이미 broadcast 나눗셈을 역수 곱으로 최적화하거나 나눗셈이 병목이 아님. **인코딩 비용은 나눗셈이 아니라 amax
+리덕션(cross-lane) + 자릿수 peel(비트연산) + int↔bf16 캐스트 + 메모리 트래픽이 지배** — 실질 개선은 이쪽을
+줄여야 함(예: 인코딩을 더 큰 타일로 합치거나 캐스트 축소; 별도 과제).
 
 ---
 
