@@ -1,0 +1,44 @@
+# Ozaki-1 fp attention via the Triton FLASH kernel (flash_ozaki) on GSM8K, in vLLM.
+#
+# Run (single GPU):
+#   CUDA_VISIBLE_DEVICES=<free_gpu> conda run -n quantized-reasoning-models \
+#       python inference_vllm.py --config configs/ozaki1_fp_flash_gsm8k.yaml
+#
+# Any field here can be overridden on the CLI (precedence: CLI > YAML > default).
+# Keys are the inference_vllm.py long flag names without the leading '--'.
+
+# --- model / dataset ---
+model: ./modelzoo/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
+dataset: GSM8K
+
+# --- Ozaki emulation: attention QK^T/PV through the flash_ozaki Triton kernel ---
+ozaki_placement: attn_only     # attention QK^T/PV via ozaki; linear stays native bf16 (stock Qwen2).
+#                              #   use `full` for linear ozaki too -- then byte_split_style below also
+#                              #   applies to the linears (must stay all_signed_no_clamp for flash).
+rslt_type: ozaki1_fp           # REQUIRED for flash (bf16 block-FP datapath; ozaki2_fp/RNS stays eager).
+ozaki_flash: true              # run attention through the online-softmax flash_ozaki kernel (non-cached,
+#                              #   GQA head-fold) instead of the eager batched_gemm path. Falls back to
+#                              #   EAGER (with a warning) unless rslt_type==ozaki1_fp AND the style below
+#                              #   is all_signed_no_clamp -- the only config the codegen kernel is
+#                              #   bit-faithful to production for (verified across w=2/4/8).
+byte_split_style: all_signed_no_clamp   # REQUIRED for flash (clamp_pos diverges ~0.26 -> eager fallback).
+gemm_bits: 4                   # GEMM unit width w. w=4 nmp=10 is the validated flash config (RESULTS.md).
+nmp: 10                        # block-FP GEMM count. valid for w=4: 1/3/4/6/9/10/15/16 (nD^2 or triangular).
+k: 32                          # reduction-dim chunk size (QK head_dim -> KQ chunks; PV kv tile = BLOCK_N).
+
+# Per-op nmp (attn_score vs attn_output): give QK^T and P@V different nmp by matching the op names.
+# The flash path resolves nmp_overrides against "<layer>.attn_weights" (QK^T) and "<layer>.attn_output"
+# (P@V), first-regex-match-wins, else the base nmp above. Example (uncomment): coarser P@V.
+# nmp_overrides:
+#   attn_weights: 10
+#   attn_output: 6
+
+# (linear weight cache: --weight_cache / the weight_cache_prefill alias -- only relevant for `full`.)
+# (s / scale_method / shift_bits / M_frac_bits / combine_fp64 are Ozaki-2 only -- ignored here.)
+
+# --- generation (paper settings; also the inference_vllm.py defaults) ---
+temperature: 0.6
+top_p: 0.95
+seed: 42
+max_new_tokens: 32768
+max_model_length: 32768
