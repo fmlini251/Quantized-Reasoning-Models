@@ -172,7 +172,7 @@ def _gather_kv_from_cache(key_cache, value_cache, block_table, seq_len, num_kv_h
 def install_ozaki_attention_backend(nmp=None, chunk_size=32, rslt_type="ozaki1_fp", s=None,
                                     scale_method="new_compressed", shift_bits=7, M_frac_bits=8,
                                     gemm_bits=8, byte_split_style="all_signed_clamp_pos", flash=None,
-                                    nmp_overrides=None):
+                                    nmp_overrides=None, kv_cache_prefill=False):
     """Monkeypatch vLLM's attention-backend selector to return OzakiAttentionBackend.
     Call BEFORE the LLM is built (attention layers resolve the backend at construction).
 
@@ -180,8 +180,18 @@ def install_ozaki_attention_backend(nmp=None, chunk_size=32, rslt_type="ozaki1_f
     rslt_type==ozaki1_fp) attention runs through the Triton flash_ozaki kernel (online-softmax,
     non-cached, GQA-fold) instead of the eager batched_gemm path -- same ozaki1_fp math, ~e-3 apart.
     nmp_overrides: {regex: nmp} applied to the attention ops too -- match "attn_weights" (QK^T =
-    attn_score) and/or "attn_output" (P@V) to give the two attention GEMMs different nmp."""
+    attn_score) and/or "attn_output" (P@V) to give the two attention GEMMs different nmp.
+    kv_cache_prefill: NOT IMPLEMENTED -- caching the ozaki digit-planes of K/V would multiply the
+    KV-cache footprint by nD (3-5x for w4 nmp9-16), prohibitive for vLLM's KV-capacity-bound
+    throughput, so it is intentionally blocked (raises NotImplementedError). Use non-cached flash."""
     import json
+    if kv_cache_prefill:
+        raise NotImplementedError(
+            "kv_cache_prefill (caching ozaki K/V digit-planes for reuse across decode steps) is not "
+            "implemented: it would multiply the vLLM KV cache by nD (the number of digit planes -- "
+            "e.g. 4x for w4 nmp10, 5x for w4 nmp15), and since vLLM throughput is bound by KV-cache "
+            "capacity (concurrency x context) that nD x blowup is a net loss versus the ~1.3x per-op "
+            "decode gain. Use the default non-cached flash path (--ozaki_flash) instead.")
     if flash is not None:
         os.environ["OZAKI_ATTN_FLASH"] = "1" if flash else "0"
     if nmp is not None:

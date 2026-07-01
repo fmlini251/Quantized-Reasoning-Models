@@ -110,6 +110,13 @@ def parser_gen():
                         help='Preferred alias for --weight_cache (the linear weight is block-FP '
                              'encoded once at prefill and reused across all decode steps). Non-breaking: '
                              '--weight_cache still works and the run-hash key stays "weight_cache".')
+    parser.add_argument('--kv_cache_prefill', action='store_true',
+                        help='(NOT IMPLEMENTED) Cache the ozaki digit-planes of K/V so decode reuses '
+                             'them instead of re-encoding each step. This multiplies the KV-cache '
+                             'footprint by nD (the number of digit planes, e.g. 3-5x for w4 nmp9-16), '
+                             'which is prohibitive for vLLM throughput (KV-capacity bound), so the path '
+                             'is intentionally blocked (raises NotImplementedError). Use the default '
+                             'non-cached flash (--ozaki_flash).')
     parser.add_argument('--combine_fp64', action='store_true',
                         help='Accumulate the ozaki2_fp place-value combine in fp64 (matches the '
                              'emulation ppl baseline, ~1e-7, ~2x slower). Default is fp32 '
@@ -392,7 +399,8 @@ def main(args):
                                         gemm_bits=args.gemm_bits,
                                         byte_split_style=args.byte_split_style,
                                         flash=args.ozaki_flash,
-                                        nmp_overrides=args.nmp_overrides)
+                                        nmp_overrides=args.nmp_overrides,
+                                        kv_cache_prefill=args.kv_cache_prefill)
 
     results, details = vllm(
         model_config=model_config,
