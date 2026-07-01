@@ -373,6 +373,21 @@ per-step(append 91 + cached-attn 590 = 682µs)이 naive(757µs)를 **1.11× 이�
 - ozaki 오차(1.6e-3)의 약 1/250 → 무시 가능. (chunk=None에선 두 경로 구조가 정렬돼 cached vs non-cached가
   정확히 `0.00e+00`; decode도 `0.00e+00`.)
 
+### E.4 권장 (vLLM 서빙 default): **non-cached** (`flash_oz1fp_cg`)
+캐시는 K/V를 **nD개 자릿수 평면**으로 저장하므로 KV 캐시 메모리가 **nD× 선형 증가**한다 (E.1: raw bf16 K+V
+≈ 29.4MB → w4 nmp9 nD3 = 89.9MB(**3×**) / nmp10 nD4 = 119.3MB(**4×**) / nmp15 nD5 = 148.6MB(**5×**)).
+
+vLLM 처리량은 **KV 캐시 용량**(동시 시퀀스 수 × 컨텍스트 길이, paged blocks)에 지배된다. cached의 nD×(3~5×)
+블로우업은 배치/컨텍스트를 그만큼 줄여 **처리량 순손실이 캐시의 ~1.3× 이득을 크게 초과**한다(예: nD=4면 KV 용량
+~1/4 → 동시성 ~1/4, 토큰당 1.3× 이득으로 상쇄 불가). 따라서:
+
+- **서빙 기본 = non-cached**: 매 호출 K/V를 fused triton 커널 **안에서** 재인코딩(호출당 ~22–28%, 이미 상각)하고
+  KV를 **1×(raw bf16)** 로 유지해 배치/컨텍스트 용량을 최대화. flash_oz1fp_cg API도 이미 non-cached가 기본이며,
+  cached는 `flash_oz1fp_cg_cached`+`encode_kv` **opt-in**.
+- **cached는 예외적으로만**: 메모리가 남고 지연이 결정적인 **저동시성/단일 시퀀스**(배치 1, KV가 병목 아님)에서만.
+- 참고: 현재 vLLM 백엔드(`vllm_custom/.../ozaki_attention.py`)는 eager `batched_gemm` 경로라 flash 캐시가
+  **아직 미연동**. flash_ozaki를 백엔드로 승격할 때도 위 이유로 non-cached를 기본으로 둔다.
+
 ---
 
 ## 핵심 결론
@@ -386,3 +401,6 @@ per-step(append 91 + cached-attn 590 = 682µs)이 naive(757µs)를 **1.11× 이�
    하고 chunk=None보다 빠르다. cached 경로도 동일 지원(cached vs non-cached: chunk=32 prefill은 fp-순서 ~6e-6,
    chunk=None/decode는 비트동일).
 4. **fused-Triton은 저강도 어텐션에서 production을 3~9× 앞서고**, 큰 compute-bound GEMM은 cuBLAS가 유리.
+5. **KV 캐시는 opt-in, 서빙 기본은 non-cached** (E.4): 캐시는 KV 메모리를 **nD×(3~5×) 선형 증가**시키는 대가로
+   ~1.3×만 얻는다. vLLM은 KV 용량이 처리량(동시성·컨텍스트)을 좌우하므로 순손실 → 배치/컨텍스트 최대화를 위해
+   non-cached를 기본으로. cached는 저동시성·지연-critical 예외에서만.

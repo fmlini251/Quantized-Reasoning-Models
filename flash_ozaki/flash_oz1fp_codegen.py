@@ -737,7 +737,13 @@ def flash_oz1fp_cg_cached(q, kv, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm
     length N). MHA: Hq==Hkv. GQA: Hq=Hkv*G -> the G query heads sharing each cached kv head fold into
     the query-row dim, so one cache tile feeds all G. Prefill T==N; decode/chunked T<N (q token i at abs
     kv pos N-T+i). EXACT vs non-cached flash_oz1fp_cg for the same config. chunk_size MUST match the
-    encode_kv call: it chunks K's head_dim (KQ, via k_scale[Z,nchd,N]) and V's kv (BLOCK_N)."""
+    encode_kv call: it chunks K's head_dim (KQ, via k_scale[Z,nchd,N]) and V's kv (BLOCK_N).
+
+    OPT-IN, not the serving default: the cache stores nD digit planes for K and V, so KV-cache memory
+    grows nD x (3-5x for w4 nmp9-15) for only a ~1.3x speedup (RESULTS.md E.2/E.4). Since vLLM throughput
+    is bound by KV-cache capacity (concurrency x context), that nD x blowup is a net throughput loss --
+    prefer non-cached flash_oz1fp_cg (re-encodes K/V in-kernel, KV stays 1x). Use this cached path only
+    for low-concurrency / latency-critical single-sequence cases where KV memory is not the bottleneck."""
     nmp_pv = nmp if nmp_pv is None else nmp_pv
     w_pv = w if w_pv is None else w_pv
     no_clamp = 1 if byte_split_style == "all_signed_no_clamp" else 0
