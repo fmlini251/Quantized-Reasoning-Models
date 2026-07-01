@@ -1,5 +1,8 @@
 # flash_ozaki verification — vs production `ozaki1_batched_gemm_fp` and vs SDPA
 
+> 최신 재현 수치(2026-07-01, A6000 gpu:0, 코드젠 수렴 이후)는 **[RESULTS.md](RESULTS.md)** (한국어) 참고.
+> 이 README는 방법론/파일 설명 + 초기 측정치.
+
 Validation that the **flash-attention ozaki1_fp kernels** (codegen path: optimal pack plan +
 single-peel place-folded planes) faithfully reproduce the production emulation
 `emulation/llm/ozaki_matmul.py::ozaki1_batched_gemm_fp`, plus a full-attention speed/accuracy
