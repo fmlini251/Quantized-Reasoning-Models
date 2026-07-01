@@ -594,6 +594,24 @@ def encode_kv(k, v, nmp, w, nmp_pv=None, w_pv=None, byte_split_style="all_signed
             v_pl.contiguous(), v_scale.contiguous())
 
 
+def encode_kv_append(kv, k_new, v_new, nmp, w, nmp_pv=None, w_pv=None,
+                     byte_split_style="all_signed_no_clamp", chunk_size=None, block_n=64):
+    """INCREMENTAL decode append: encode ONLY the new tokens' K/V (k_new,v_new:[B,H,n_new,D]) and
+    concatenate to an existing cache `kv` along the kv-length axis. Cost is O(n_new), independent of
+    the cached length -- vs re-encoding the whole cache every step. Because V is block-FP-scaled per
+    `block_n`-token chunk, n_new must be a multiple of the V chunk (next_pow2(chunk_size) if chunk_size
+    else block_n) so the appended v_scale rows align to whole chunks. Returns the extended cache."""
+    k_pl, k_scale, v_pl, v_scale = kv
+    n = encode_kv(k_new, v_new, nmp, w, nmp_pv, w_pv, byte_split_style, chunk_size, block_n)
+    bn = triton.next_power_of_2(chunk_size) if chunk_size is not None else block_n
+    assert k_new.shape[2] % bn == 0, \
+        f"n_new={k_new.shape[2]} must be a multiple of the V chunk {bn} to keep v_scale chunk-aligned"
+    return (torch.cat([k_pl, n[0]], dim=2),        # [Z,nD_qk,N,D] on N
+            torch.cat([k_scale, n[1]], dim=2),     # [Z,nchd,N]    on N
+            torch.cat([v_pl, n[2]], dim=2),        # [Z,nD_pv,N,D] on N
+            torch.cat([v_scale, n[3]], dim=1))     # [Z,nch,D]     on chunk axis
+
+
 def flash_oz1fp_cg_cached(q, kv, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scale=None,
                           byte_split_style="all_signed_no_clamp", chunk_size=None, BLOCK_M=64, BLOCK_N=64,
                           num_warps=4, num_stages=1):
