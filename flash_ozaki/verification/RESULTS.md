@@ -151,11 +151,18 @@ flash-ozaki(nmp10)는 **순수 bf16 어텐션(SDPA/flash-exact)만큼 — 오히
 
 본질적으로 int8 ozaki 수치를 SW로 재현하는 비용(HW int8 데이터패스 대체).
 
-**시도했다 기각한 레버 — `a/scale` → 역수 곱:** scale이 2^k라 `a*(1/scale)`은 bit-exact(faithfulness 유지 확인).
-그러나 **속도 개선 없음**(GEMM 0.314→0.309, prefill nmp10 8.0×→7.9×, 노이즈 수준) → 원복. 이유: Triton/ptxas가
-이미 broadcast 나눗셈을 역수 곱으로 최적화하거나 나눗셈이 병목이 아님. **인코딩 비용은 나눗셈이 아니라 amax
-리덕션(cross-lane) + 자릿수 peel(비트연산) + int↔bf16 캐스트 + 메모리 트래픽이 지배** — 실질 개선은 이쪽을
-줄여야 함(예: 인코딩을 더 큰 타일로 합치거나 캐스트 축소; 별도 과제).
+**시도했다 기각한 op-레버 3종 (모두 bit-exact, 모두 속도 무변):**
+| 시도 | 결과 |
+|---|---|
+| `a/scale` → 역수 곱 (scale=2^k) | GEMM 0.314→0.309, prefill nmp10 8.0×→7.9× (노이즈) |
+| `_bfp_scale` exp2 → 정수지수 비트구성 | nmp1 3.7×, nmp9/10 무변 |
+| P amax → softmax의 타일 max 재사용(리덕션 제거) | nmp9 6.1→6.0×, 나머지 무변 |
+
+셋 다 faithfulness 유지(Â bit-identical)이나 이득 없음 → **인코딩 비용은 개별 산술/리덕션이 아니라 구조적**
+(Q/K/P/V 4개 피연산자의 메모리 트래픽 + int↔bf16 캐스트 + occupancy)이다. Triton/ptxas가 나눗셈/exp2를 이미
+최적화하고, 리덕션도 병목이 아니라 op 하나 빼도 안 변함. **실효 레버**: ① K/V 캐싱(구현됨, 4개 중 2개 인코딩을
+루프에서 제거, ~1.3×) — 유일하게 검증된 방법; ② occupancy 오토튜닝(num_warps/stages/BLOCK, Part C에서 속도를
+지배); ③ 근본적으론 HW int8 데이터패스(에뮬 대상)나 더 거친 인코딩(faithfulness 희생)만 큰 이득.
 
 ---
 
