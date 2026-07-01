@@ -383,7 +383,8 @@ def main(args):
                                         shift_bits=args.shift_bits, M_frac_bits=args.M_frac_bits,
                                         gemm_bits=args.gemm_bits,
                                         byte_split_style=args.byte_split_style,
-                                        flash=args.ozaki_flash)
+                                        flash=args.ozaki_flash,
+                                        nmp_overrides=args.nmp_overrides)
 
     results, details = vllm(
         model_config=model_config,

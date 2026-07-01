@@ -44,7 +44,8 @@ _OZAKI_ATTN_ANNOUNCED = False
 
 def set_ozaki_attention_params(nmp, chunk_size=32, rslt_type="ozaki1_fp", s=None,
                                scale_method="new_compressed", shift_bits=7, M_frac_bits=8,
-                               gemm_bits=8, byte_split_style="all_signed_clamp_pos"):
+                               gemm_bits=8, byte_split_style="all_signed_clamp_pos",
+                               nmp_overrides=None):
     global _OZAKI_ATTN_PARAMS
     _OZAKI_ATTN_PARAMS = {
         "nmp": int(nmp), "chunk_size": int(chunk_size), "rslt_type": rslt_type,
@@ -55,6 +56,10 @@ def set_ozaki_attention_params(nmp, chunk_size=32, rslt_type="ozaki1_fp", s=None
         "gemm_bits": int(gemm_bits),
         # Ozaki-1 integer digit-split (chunk) method.
         "byte_split_style": byte_split_style,
+        # Per-op nmp overrides {regex-pattern: nmp}. Attention resolves them against the op names
+        # "<layer>.attn_weights" (QK^T) and "<layer>.attn_output" (P@V) -> attn_score and attn_output
+        # can use different nmp. None => base nmp for both.
+        "nmp_overrides": (dict(nmp_overrides) if nmp_overrides else None),
     }
 
 
@@ -62,7 +67,9 @@ def _resolve_params():
     if _OZAKI_ATTN_PARAMS is not None:
         return _OZAKI_ATTN_PARAMS
     # Fallback to env (so spawned workers that re-import this module still get the config).
+    import json
     _s = os.environ.get("OZAKI_ATTN_S", "")
+    _ov = os.environ.get("OZAKI_ATTN_NMP_OVERRIDES", "")
     return {
         "nmp": int(os.environ.get("OZAKI_ATTN_NMP", "6")),
         "chunk_size": int(os.environ.get("OZAKI_ATTN_CHUNK", "32")),
@@ -73,7 +80,19 @@ def _resolve_params():
         "M_frac_bits": int(os.environ.get("OZAKI_ATTN_M_FRAC_BITS", "8")),
         "gemm_bits": int(os.environ.get("OZAKI_ATTN_GEMM_BITS", "8")),
         "byte_split_style": os.environ.get("OZAKI_ATTN_BYTE_SPLIT_STYLE", "all_signed_clamp_pos"),
+        "nmp_overrides": (json.loads(_ov) if _ov not in ("", "None") else None),
     }
+
+
+def _resolve_nmp(name, overrides, base):
+    """Per-op nmp: first override whose regex matches ``name`` wins, else ``base`` (mirrors the
+    emulation batched_gemm dispatcher used by the eager path)."""
+    if overrides:
+        import re
+        for pat, val in overrides.items():
+            if re.search(pat, name):
+                return int(val)
+    return int(base)
 
 
 def _pad_reduction_to_chunk(A, B, chunk_size):
@@ -152,18 +171,22 @@ def _gather_kv_from_cache(key_cache, value_cache, block_table, seq_len, num_kv_h
 
 def install_ozaki_attention_backend(nmp=None, chunk_size=32, rslt_type="ozaki1_fp", s=None,
                                     scale_method="new_compressed", shift_bits=7, M_frac_bits=8,
-                                    gemm_bits=8, byte_split_style="all_signed_clamp_pos", flash=None):
+                                    gemm_bits=8, byte_split_style="all_signed_clamp_pos", flash=None,
+                                    nmp_overrides=None):
     """Monkeypatch vLLM's attention-backend selector to return OzakiAttentionBackend.
     Call BEFORE the LLM is built (attention layers resolve the backend at construction).
 
     flash: None (default) leaves OZAKI_ATTN_FLASH as-is; True/False sets it. When enabled (and
     rslt_type==ozaki1_fp) attention runs through the Triton flash_ozaki kernel (online-softmax,
-    non-cached, GQA-fold) instead of the eager batched_gemm path -- same ozaki1_fp math, ~e-3 apart."""
+    non-cached, GQA-fold) instead of the eager batched_gemm path -- same ozaki1_fp math, ~e-3 apart.
+    nmp_overrides: {regex: nmp} applied to the attention ops too -- match "attn_weights" (QK^T =
+    attn_score) and/or "attn_output" (P@V) to give the two attention GEMMs different nmp."""
+    import json
     if flash is not None:
         os.environ["OZAKI_ATTN_FLASH"] = "1" if flash else "0"
     if nmp is not None:
         set_ozaki_attention_params(nmp, chunk_size, rslt_type, s, scale_method, shift_bits,
-                                   M_frac_bits, gemm_bits, byte_split_style)
+                                   M_frac_bits, gemm_bits, byte_split_style, nmp_overrides)
         os.environ["OZAKI_ATTN_NMP"] = str(nmp)
         os.environ["OZAKI_ATTN_CHUNK"] = str(chunk_size)
         os.environ["OZAKI_ATTN_RSLT"] = rslt_type
@@ -174,6 +197,8 @@ def install_ozaki_attention_backend(nmp=None, chunk_size=32, rslt_type="ozaki1_f
         os.environ["OZAKI_ATTN_M_FRAC_BITS"] = str(M_frac_bits)
         os.environ["OZAKI_ATTN_GEMM_BITS"] = str(gemm_bits)
         os.environ["OZAKI_ATTN_BYTE_SPLIT_STYLE"] = byte_split_style
+        # per-op nmp overrides -> JSON env for spawned TP workers.
+        os.environ["OZAKI_ATTN_NMP_OVERRIDES"] = (json.dumps(nmp_overrides) if nmp_overrides else "")
     os.environ["OZAKI_FULL_ATTENTION"] = "1"
 
     def _patched(*args, **kwargs):
@@ -228,12 +253,23 @@ class OzakiAttentionImpl(XFormersImpl):
                 s=p.get("s"), scale_method=p.get("scale_method", "new_compressed"),
                 shift_bits=p.get("shift_bits", 7), M_frac_bits=p.get("M_frac_bits", 8),
                 gemm_bits=p.get("gemm_bits", 8),
-                byte_split_style=p.get("byte_split_style", "all_signed_clamp_pos"))
+                byte_split_style=p.get("byte_split_style", "all_signed_clamp_pos"),
+                nmp_overrides=p.get("nmp_overrides"))   # eager: batched_gemm resolves per-op by name
             self._oz_p = p
-            # Flash path (Triton flash_ozaki kernel): opt-in via OZAKI_ATTN_FLASH=1, ozaki1_fp only
-            # (the flash codegen kernel emulates the bf16 ozaki1_fp datapath; ozaki2_fp/RNS stays eager).
-            self._oz_flash = (os.environ.get("OZAKI_ATTN_FLASH", "0") == "1"
-                              and p["rslt_type"] == "ozaki1_fp")
+            self._oz_ovr = p.get("nmp_overrides")       # flash: resolved per-op in _flash()
+            # Flash path (Triton flash_ozaki kernel): opt-in via OZAKI_ATTN_FLASH=1. The codegen kernel
+            # is bit-faithful to production only for ozaki1_fp + all_signed_no_clamp (verified across
+            # w=2/4/8); its clamp path diverges (~0.26 relerr) and ozaki2_fp/RNS is unsupported. Anything
+            # else falls back to the eager batched_gemm path (faithful to every style) with a warning.
+            _flash_req = os.environ.get("OZAKI_ATTN_FLASH", "0") == "1"
+            _style = p.get("byte_split_style", "all_signed_clamp_pos")
+            self._oz_flash = (_flash_req and p["rslt_type"] == "ozaki1_fp"
+                              and _style == "all_signed_no_clamp")
+            if _flash_req and not self._oz_flash:
+                import logging
+                logging.getLogger("vllm").warning(
+                    "[Ozaki] OZAKI_ATTN_FLASH=1 but incompatible (rslt=%s, byte_split_style=%s) -- flash "
+                    "requires ozaki1_fp + all_signed_no_clamp; using EAGER.", p["rslt_type"], _style)
             global _OZAKI_ATTN_ANNOUNCED
             if not _OZAKI_ATTN_ANNOUNCED:
                 _OZAKI_ATTN_ANNOUNCED = True
@@ -244,12 +280,16 @@ class OzakiAttentionImpl(XFormersImpl):
                     "attention QK^T/PV via ozaki", os.getpid(), p["nmp"], p["rslt_type"],
                     "flash" if self._oz_flash else "eager")
 
-    def _flash(self, q4, k4, v4, kv_lens=None):
+    def _flash(self, q4, k4, v4, name, kv_lens=None):
         """Ozaki1_fp Triton flash kernel. q4:[B,Hq,T,D]; k4,v4:[B,Hkv,N,D] (GQA folded internally).
-        Causal online-softmax; kv_lens[B] masks padded decode positions. Returns [B,Hq,T,D]."""
+        Causal online-softmax; kv_lens[B] masks padded decode positions. Returns [B,Hq,T,D].
+        Per-op nmp: QK^T (attn_score) resolves nmp_overrides against "<name>.attn_weights", P@V
+        (attn_output) against "<name>.attn_output" -- matching the eager batched_gemm op names."""
         from flash_ozaki.flash_oz1fp_codegen import flash_oz1fp_cg
-        p = self._oz_p
-        return flash_oz1fp_cg(q4, k4, v4, nmp=p["nmp"], w=p["gemm_bits"], causal=True,
+        p = self._oz_p; w = p["gemm_bits"]
+        nmp_qk = _resolve_nmp(name + ".attn_weights", self._oz_ovr, p["nmp"])
+        nmp_pv = _resolve_nmp(name + ".attn_output", self._oz_ovr, p["nmp"])
+        return flash_oz1fp_cg(q4, k4, v4, nmp=nmp_qk, w=w, nmp_pv=nmp_pv, w_pv=w, causal=True,
                               sm_scale=self.scale, chunk_size=p["chunk_size"],
                               byte_split_style=p["byte_split_style"], kv_lens=kv_lens)
 
@@ -293,7 +333,7 @@ class OzakiAttentionImpl(XFormersImpl):
                 # Flash: causal alone is correct here -- a valid query at posn<lens attends only kv<=posn
                 # (all valid); padded query rows (posn>=lens) are computed but discarded by the index below.
                 o4 = self._flash(qp.permute(0, 2, 1, 3), kp.permute(0, 2, 1, 3),
-                                 vp.permute(0, 2, 1, 3))                    # [P,nH,Lm,hd]
+                                 vp.permute(0, 2, 1, 3), layer.layer_name)  # [P,nH,Lm,hd]
                 out[:nq] = o4.permute(0, 2, 1, 3)[seq_id, posn]
             else:
                 q = qp.permute(0, 2, 1, 3).reshape(P * nH, Lm, hd)
@@ -342,7 +382,7 @@ class OzakiAttentionImpl(XFormersImpl):
                     # seq_len were gathered from clamped/garbage slots but n_end+mask never touch them).
                     o4 = self._flash(dq[:, :, None, :],                        # [d,nH,1,hd]
                                      K.permute(0, 2, 1, 3), V.permute(0, 2, 1, 3),  # [d,nKV,Lm,hd]
-                                     kv_lens=seq_lens)                         # [d,nH,1,hd]
+                                     layer.layer_name, kv_lens=seq_lens)       # [d,nH,1,hd]
                     out[nq + s0:nq + e0] = o4.reshape(d, nH, hd)
                 else:
                     # GQA-grouped: keep K/V at nKV heads (do NOT repeat to nH); treat each KV
