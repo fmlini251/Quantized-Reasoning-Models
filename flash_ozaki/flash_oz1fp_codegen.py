@@ -194,55 +194,62 @@ def _emit_dots(acc, plan, a, b, trans_b, ind):
     return "\n".join(L)
 
 
-def _gen_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp):
+def _gen_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
     nD_qk = oz1fp_params(nmp_qk, w_qk)[0]
     nD_pv = oz1fp_params(nmp_pv, w_pv)[0]
     ib_qk = w_qk * nD_qk - 1                                  # production int_bits = w*nD-1
     ib_pv = w_pv * nD_pv - 1
     plan_qk = pack_plan(nmp_qk, w_qk)
     plan_pv = pack_plan(nmp_pv, w_pv)
-    I = "    "                                                   # body indent
-    L = "        "                                               # kv-loop indent
-    src = f'''
-@triton.jit
-def _flash_cg(
-    Q, K, V, Out, sm_scale, Z, N_CTX, Q_LEN, Q_OFF,
-    sqz, sqn, sqd, skz, skn, skd, svz, svn, svd, soz, son, sod,
-    HEAD_DIM: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    CAUSAL: tl.constexpr, GQA_G: tl.constexpr,
-):
-    pid_m = tl.program_id(0); pid_z = tl.program_id(1)
-    offm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offd = tl.arange(0, BLOCK_D)
-    dmask = offd < HEAD_DIM
-    mmask = offm < Q_LEN
-    qmask = mmask[:, None] & dmask[None, :]
-    q = tl.load(Q + pid_z * sqz + offm[:, None] * sqn + offd[None, :] * sqd, mask=qmask, other=0.0)
+    I, L, L2 = "    ", "        ", "            "               # body / kv-loop / head-dim-chunk indents
+    lo_qk, hi_qk = -(1 << ib_qk), (1 << ib_qk) - 1
+    lo_pv, hi_pv = -(1 << ib_pv), (1 << ib_pv) - 1
+
+    # QK block-FP scale granularity:
+    #  * hoisted (chunk_size None / >= D): one scale over the full head_dim, Q peeled ONCE outside the
+    #    kv loop and reused across tiles -- fastest, but coarser than production's chunk_size.
+    #  * chunked (chunk_size < D): head_dim reduction split into KQ-wide block-FP chunks, per-chunk
+    #    scale accumulated -- matches production's chunk_size exactly. Q is re-encoded per kv tile
+    #    (per-chunk planes can't be hoisted across a runtime chunk loop), so it is slower.
+    if not chunked:
+        qk_pre = f'''    q = tl.load(Q + pid_z * sqz + offm[:, None] * sqn + offd[None, :] * sqd, mask=qmask, other=0.0)
     qsc = _bfp_scale(tl.max(tl.abs(q), axis=1).to(tl.float32), {ib_qk})
     qI = (q / qsc[:, None] + tl.where(q >= 0, 0.5, -0.5)).to(tl.int32)
-    qI = tl.minimum(tl.maximum(qI, {-(1 << ib_qk)}), {(1 << ib_qk) - 1})   # block-FP clamp [-2^ib,2^ib-1]
-{_emit_peel("q", "qI", w_qk, nD_qk, no_clamp, I)}
-    m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
-    l_i = tl.zeros([BLOCK_M], tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
-    if CAUSAL:
-        last_m = tl.minimum((pid_m + 1) * BLOCK_M, Q_LEN) - 1
-        n_end = tl.minimum(Q_OFF + last_m // GQA_G + 1, N_CTX)
-    else:
-        n_end = N_CTX
-    for n0 in range(0, n_end, BLOCK_N):
-        offn = n0 + tl.arange(0, BLOCK_N)
-        nmask = offn < N_CTX
-        k = tl.load(K + pid_z * skz + offn[:, None] * skn + offd[None, :] * skd,
+    qI = tl.minimum(tl.maximum(qI, {lo_qk}), {hi_qk})   # block-FP clamp [-2^ib,2^ib-1]
+{_emit_peel("q", "qI", w_qk, nD_qk, no_clamp, I)}'''
+        qk_body = f'''        k = tl.load(K + pid_z * skz + offn[:, None] * skn + offd[None, :] * skd,
                     mask=nmask[:, None] & dmask[None, :], other=0.0)
         ksc = _bfp_scale(tl.max(tl.abs(k), axis=1).to(tl.float32), {ib_qk})
         kI = (k / ksc[:, None] + tl.where(k >= 0, 0.5, -0.5)).to(tl.int32)
-        kI = tl.minimum(tl.maximum(kI, {-(1 << ib_qk)}), {(1 << ib_qk) - 1})
+        kI = tl.minimum(tl.maximum(kI, {lo_qk}), {hi_qk})
 {_emit_peel("k", "kI", w_qk, nD_qk, no_clamp, L)}
         cacc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
 {_emit_dots("cacc", plan_qk, "q", "k", True, L)}
-        qk = cacc * qsc[:, None] * ksc[None, :] * sm_scale
-        qk = tl.where(nmask[None, :], qk, -float("inf"))
+        qk = cacc * qsc[:, None] * ksc[None, :] * sm_scale'''
+    else:
+        qk_pre = ""
+        qk_body = f'''        qk = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+        for dc in range(0, HEAD_DIM, KQ):                         # chunk the head_dim reduction by KQ
+            offc = dc + tl.arange(0, KQ)
+            cmask = offc < HEAD_DIM
+            qc = tl.load(Q + pid_z * sqz + offm[:, None] * sqn + offc[None, :] * sqd,
+                         mask=mmask[:, None] & cmask[None, :], other=0.0)
+            qsc = _bfp_scale(tl.max(tl.abs(qc), axis=1).to(tl.float32), {ib_qk})
+            qI = (qc / qsc[:, None] + tl.where(qc >= 0, 0.5, -0.5)).to(tl.int32)
+            qI = tl.minimum(tl.maximum(qI, {lo_qk}), {hi_qk})
+{_emit_peel("q", "qI", w_qk, nD_qk, no_clamp, L2)}
+            kc = tl.load(K + pid_z * skz + offn[:, None] * skn + offc[None, :] * skd,
+                         mask=nmask[:, None] & cmask[None, :], other=0.0)
+            ksc = _bfp_scale(tl.max(tl.abs(kc), axis=1).to(tl.float32), {ib_qk})
+            kI = (kc / ksc[:, None] + tl.where(kc >= 0, 0.5, -0.5)).to(tl.int32)
+            kI = tl.minimum(tl.maximum(kI, {lo_qk}), {hi_qk})
+{_emit_peel("k", "kI", w_qk, nD_qk, no_clamp, L2)}
+            cacc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+{_emit_dots("cacc", plan_qk, "q", "k", True, L2)}
+            qk += cacc * qsc[:, None] * ksc[None, :]              # per-chunk block-FP, accumulated
+        qk = qk * sm_scale'''
+
+    tail = f'''        qk = tl.where(nmask[None, :], qk, -float("inf"))
         if CAUSAL:
             qk = tl.where((Q_OFF + offm // GQA_G)[:, None] >= offn[None, :], qk, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -254,16 +261,45 @@ def _flash_cg(
         psc = _bfp_scale(tl.max(p, axis=1), {ib_pv})
         vsc = _bfp_scale(tl.max(tl.abs(v), axis=0).to(tl.float32), {ib_pv})
         pI = (p / psc[:, None] + 0.5).to(tl.int32)
-        pI = tl.minimum(pI, {(1 << ib_pv) - 1})
+        pI = tl.minimum(pI, {hi_pv})
         vI = (v / vsc[None, :] + tl.where(v >= 0, 0.5, -0.5)).to(tl.int32)
-        vI = tl.minimum(tl.maximum(vI, {-(1 << ib_pv)}), {(1 << ib_pv) - 1})
+        vI = tl.minimum(tl.maximum(vI, {lo_pv}), {hi_pv})
 {_emit_peel("pp", "pI", w_pv, nD_pv, no_clamp, L)}
 {_emit_peel("vv", "vI", w_pv, nD_pv, no_clamp, L)}
         pv = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
 {_emit_dots("pv", plan_pv, "pp", "vv", False, L)}
         pv = pv * psc[:, None] * vsc[None, :]
         acc = acc * alpha[:, None] + pv
-        m_i = m_new
+        m_i = m_new'''
+
+    src = f'''
+@triton.jit
+def _flash_cg(
+    Q, K, V, Out, sm_scale, Z, N_CTX, Q_LEN, Q_OFF,
+    sqz, sqn, sqd, skz, skn, skd, svz, svn, svd, soz, son, sod,
+    HEAD_DIM: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    CAUSAL: tl.constexpr, GQA_G: tl.constexpr, KQ: tl.constexpr,
+):
+    pid_m = tl.program_id(0); pid_z = tl.program_id(1)
+    offm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offd = tl.arange(0, BLOCK_D)
+    dmask = offd < HEAD_DIM
+    mmask = offm < Q_LEN
+    qmask = mmask[:, None] & dmask[None, :]
+{qk_pre}
+    m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
+    if CAUSAL:
+        last_m = tl.minimum((pid_m + 1) * BLOCK_M, Q_LEN) - 1
+        n_end = tl.minimum(Q_OFF + last_m // GQA_G + 1, N_CTX)
+    else:
+        n_end = N_CTX
+    for n0 in range(0, n_end, BLOCK_N):
+        offn = n0 + tl.arange(0, BLOCK_N)
+        nmask = offn < N_CTX
+{qk_body}
+{tail}
     acc = acc / l_i[:, None]
     tl.store(Out + pid_z * soz + offm[:, None] * son + offd[None, :] * sod,
              acc.to(Out.dtype.element_ty), mask=qmask)
@@ -274,8 +310,8 @@ def _flash_cg(
 _KERNEL_CACHE = {}
 
 
-def _get_kernel(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp):
-    key = (nmp_qk, w_qk, nmp_pv, w_pv, no_clamp)
+def _get_kernel(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
+    key = (nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked)
     if key not in _KERNEL_CACHE:
         src = _gen_src(*key)
         fname = f"<flash_cg_{key}>"
@@ -293,7 +329,7 @@ def _flash_exact_fwd(
     Q, K, V, Out, sm_scale, Z, N_CTX, Q_LEN, Q_OFF,
     sqz, sqn, sqd, skz, skn, skd, svz, svn, svd, soz, son, sod,
     HEAD_DIM: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    CAUSAL: tl.constexpr, GQA_G: tl.constexpr,
+    CAUSAL: tl.constexpr, GQA_G: tl.constexpr, KQ: tl.constexpr,
 ):
     """Plain bf16 flash attention (no ozaki) -- the flash-exact baseline the benches compare against.
     Same online-softmax / causal / GQA-fold structure as the generated ozaki kernel, so the two are
@@ -335,13 +371,18 @@ def _flash_exact_fwd(
 
 
 def flash_oz1fp_cg(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scale=None, ozaki=True,
-                   byte_split_style="all_signed_no_clamp", BLOCK_M=64, BLOCK_N=64,
+                   byte_split_style="all_signed_no_clamp", chunk_size=None, BLOCK_M=64, BLOCK_N=64,
                    num_warps=4, num_stages=1):
     """Code-generated Flash-Ozaki1_fp. q:[B,Hq,T,D]; k,v:[B,Hkv,N,D] bf16 (MHA Hq==Hkv; GQA Hq=Hkv*G
     folds the G group-heads into the query-row dim). nmp/w drive QK^T; nmp_pv/w_pv (default = nmp/w)
     drive P@V INDEPENDENTLY -- QK-nmp != PV-nmp is supported. Optimal pack plan + single-peel planes
     are baked into the kernel source per (nmp_qk,w_qk,nmp_pv,w_pv,style). ozaki=False runs the plain
-    bf16 flash path (same softmax/GQA machinery) -- the flash-exact baseline."""
+    bf16 flash path (same softmax/GQA machinery) -- the flash-exact baseline.
+
+    chunk_size: the block-FP chunk applied to EVERY GEMM reduction, matching production. QK's head_dim
+    reduction is split into KQ=next_pow2(min(chunk_size,D))-wide chunks, and PV's kv reduction chunk is
+    the kv tile, so BLOCK_N is set to next_pow2(chunk_size). chunk_size=None keeps the fast un-chunked
+    path (QK: one block-FP scale over the full head_dim; PV: chunk = BLOCK_N). Best power-of-2."""
     nmp_pv = nmp if nmp_pv is None else nmp_pv
     w_pv = w if w_pv is None else w_pv
     no_clamp = 1 if byte_split_style == "all_signed_no_clamp" else 0
@@ -351,13 +392,20 @@ def flash_oz1fp_cg(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scal
     assert Hq == Hkv * G, f"Hq={Hq} not a multiple of Hkv={Hkv}"
     if sm_scale is None:
         sm_scale = 1.0 / (D ** 0.5)
+    # chunk_size drives ALL reductions: QK head_dim -> KQ chunks; PV kv -> the kv tile (BLOCK_N).
+    if chunk_size is None:
+        KQ, chunked = triton.next_power_of_2(D), False
+    else:
+        KQ = triton.next_power_of_2(min(chunk_size, D))
+        chunked = KQ < D
+        BLOCK_N = triton.next_power_of_2(chunk_size)          # PV reduction chunk = kv tile = chunk_size
     Qrows = T * G
     qz = (q.reshape(B * Hkv, T, D) if G == 1 else
           q.reshape(B, Hkv, G, T, D).permute(0, 1, 3, 2, 4).reshape(B * Hkv, Qrows, D)).contiguous()
     kz, vz = (t.reshape(B * Hkv, N, D).contiguous() for t in (k, v))
     BLOCK_M = max(16, min(BLOCK_M, triton.next_power_of_2(Qrows)))
     o = torch.empty_like(qz)
-    kern = _get_kernel(nmp, w, nmp_pv, w_pv, no_clamp) if ozaki else _flash_exact_fwd
+    kern = _get_kernel(nmp, w, nmp_pv, w_pv, no_clamp, chunked) if ozaki else _flash_exact_fwd
 
     def _launch(bm):
         kern[(triton.cdiv(Qrows, bm), B * Hkv)](
@@ -365,7 +413,7 @@ def flash_oz1fp_cg(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scal
             qz.stride(0), qz.stride(1), qz.stride(2), kz.stride(0), kz.stride(1), kz.stride(2),
             vz.stride(0), vz.stride(1), vz.stride(2), o.stride(0), o.stride(1), o.stride(2),
             HEAD_DIM=D, BLOCK_D=triton.next_power_of_2(D), BLOCK_M=bm, BLOCK_N=BLOCK_N,
-            CAUSAL=causal, GQA_G=G, num_warps=num_warps, num_stages=num_stages,
+            CAUSAL=causal, GQA_G=G, KQ=KQ, num_warps=num_warps, num_stages=num_stages,
         )
     _run_with_oom_retry(_launch, BLOCK_M)
     if G == 1:
