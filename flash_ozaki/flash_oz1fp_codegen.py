@@ -28,8 +28,25 @@ import linecache
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 from flash_ozaki.oz1fp_triton import oz1fp_params
+
+
+def _run_with_oom_retry(launch, block_m):
+    """Run launch(BLOCK_M); on shared-memory OutOfResources, halve BLOCK_M (down to 16) and retry.
+    The cached kernel holds nD live K/V plane tiles, so a large-nD / triangular plan can exceed a
+    GPU's shared-memory limit at BLOCK_M=64. Attention rows are independent (softmax is per row over
+    kv), so BLOCK_M changes only occupancy/shared-mem -- never the result or the V block-FP chunking
+    -- so shrinking it stays bit-exact vs the non-cached kernel."""
+    while True:
+        try:
+            launch(block_m)
+            return
+        except OutOfResources:
+            if block_m <= 16:
+                raise
+            block_m //= 2
 
 
 @triton.jit
@@ -340,15 +357,17 @@ def flash_oz1fp_cg(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scal
     kz, vz = (t.reshape(B * Hkv, N, D).contiguous() for t in (k, v))
     BLOCK_M = max(16, min(BLOCK_M, triton.next_power_of_2(Qrows)))
     o = torch.empty_like(qz)
-    grid = (triton.cdiv(Qrows, BLOCK_M), B * Hkv)
     kern = _get_kernel(nmp, w, nmp_pv, w_pv, no_clamp) if ozaki else _flash_exact_fwd
-    kern[grid](
-        qz, kz, vz, o, sm_scale, B * Hkv, N, Qrows, N - T,
-        qz.stride(0), qz.stride(1), qz.stride(2), kz.stride(0), kz.stride(1), kz.stride(2),
-        vz.stride(0), vz.stride(1), vz.stride(2), o.stride(0), o.stride(1), o.stride(2),
-        HEAD_DIM=D, BLOCK_D=triton.next_power_of_2(D), BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        CAUSAL=causal, GQA_G=G, num_warps=num_warps, num_stages=num_stages,
-    )
+
+    def _launch(bm):
+        kern[(triton.cdiv(Qrows, bm), B * Hkv)](
+            qz, kz, vz, o, sm_scale, B * Hkv, N, Qrows, N - T,
+            qz.stride(0), qz.stride(1), qz.stride(2), kz.stride(0), kz.stride(1), kz.stride(2),
+            vz.stride(0), vz.stride(1), vz.stride(2), o.stride(0), o.stride(1), o.stride(2),
+            HEAD_DIM=D, BLOCK_D=triton.next_power_of_2(D), BLOCK_M=bm, BLOCK_N=BLOCK_N,
+            CAUSAL=causal, GQA_G=G, num_warps=num_warps, num_stages=num_stages,
+        )
+    _run_with_oom_retry(_launch, BLOCK_M)
     if G == 1:
         return o.reshape(B, Hq, T, D)
     return o.reshape(B, Hkv, T, G, D).permute(0, 1, 3, 2, 4).reshape(B, Hq, T, D)
@@ -509,18 +528,20 @@ def flash_oz1fp_cg_cached(q, kv, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm
           q.reshape(B, Hkv, G, T, D).permute(0, 1, 3, 2, 4).reshape(Zc, Qrows, D)).contiguous()
     BLOCK_M = max(16, min(BLOCK_M, triton.next_power_of_2(Qrows)))
     o = torch.empty_like(qz)
-    grid = (triton.cdiv(Qrows, BLOCK_M), Zc)
     kern = _get_cached_kernel(nmp, w, nmp_pv, w_pv, no_clamp)
-    kern[grid](
-        qz, k_pl, k_scale, v_pl, v_scale, o, sm_scale, Zc, N, Qrows, N - T,
-        qz.stride(0), qz.stride(1), qz.stride(2),
-        k_pl.stride(0), k_pl.stride(1), k_pl.stride(2), k_pl.stride(3), k_scale.stride(0), k_scale.stride(1),
-        v_pl.stride(0), v_pl.stride(1), v_pl.stride(2), v_pl.stride(3),
-        v_scale.stride(0), v_scale.stride(1), v_scale.stride(2),
-        o.stride(0), o.stride(1), o.stride(2),
-        HEAD_DIM=D, BLOCK_D=triton.next_power_of_2(D), BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        CAUSAL=causal, GQA_G=G, num_warps=num_warps, num_stages=num_stages,
-    )
+
+    def _launch(bm):
+        kern[(triton.cdiv(Qrows, bm), Zc)](
+            qz, k_pl, k_scale, v_pl, v_scale, o, sm_scale, Zc, N, Qrows, N - T,
+            qz.stride(0), qz.stride(1), qz.stride(2),
+            k_pl.stride(0), k_pl.stride(1), k_pl.stride(2), k_pl.stride(3), k_scale.stride(0), k_scale.stride(1),
+            v_pl.stride(0), v_pl.stride(1), v_pl.stride(2), v_pl.stride(3),
+            v_scale.stride(0), v_scale.stride(1), v_scale.stride(2),
+            o.stride(0), o.stride(1), o.stride(2),
+            HEAD_DIM=D, BLOCK_D=triton.next_power_of_2(D), BLOCK_M=bm, BLOCK_N=BLOCK_N,
+            CAUSAL=causal, GQA_G=G, num_warps=num_warps, num_stages=num_stages,
+        )
+    _run_with_oom_retry(_launch, BLOCK_M)
     if G == 1:
         return o.reshape(B, Hq, T, D)
     return o.reshape(B, Hkv, T, G, D).permute(0, 1, 3, 2, 4).reshape(B, Hq, T, D)
