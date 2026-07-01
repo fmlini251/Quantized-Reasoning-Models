@@ -612,6 +612,122 @@ def encode_kv_append(kv, k_new, v_new, nmp, w, nmp_pv=None, w_pv=None,
             torch.cat([v_scale, n[3]], dim=1))     # [Z,nch,D]     on chunk axis
 
 
+# --- OPTIONAL: fused-triton incremental encoder (fast decode append, no torch encode / no concat) ---
+@triton.jit
+def _enc_k_kernel(K, Kp, Ks, OFF, N_NEW,
+                  skz, skn, skd, spz, spt, spn, spd, ssz, ssc, ssn,
+                  D: tl.constexpr, IB: tl.constexpr, W: tl.constexpr, ND: tl.constexpr,
+                  NO_CLAMP: tl.constexpr, KQ: tl.constexpr, BLK: tl.constexpr):
+    """Encode BLK new K tokens x one head_dim chunk (KQ cols) -> place-folded planes + per-token scale,
+    written in-place at kv position OFF. K scale is per-token over the KQ head_dim chunk (matches
+    encode_kv / the cached kernel)."""
+    pt = tl.program_id(0); pc = tl.program_id(1); pz = tl.program_id(2)
+    offn = pt * BLK + tl.arange(0, BLK); nmask = offn < N_NEW
+    offd = pc * KQ + tl.arange(0, KQ); dmask = offd < D
+    m = nmask[:, None] & dmask[None, :]
+    k = tl.load(K + pz * skz + offn[:, None] * skn + offd[None, :] * skd, mask=m, other=0.0)
+    sc = _bfp_scale(tl.max(tl.abs(k), axis=1).to(tl.float32), IB)
+    kI = (k / sc[:, None] + tl.where(k >= 0, 0.5, -0.5)).to(tl.int32)
+    kI = tl.minimum(tl.maximum(kI, -(1 << IB)), (1 << IB) - 1)
+    tl.store(Ks + pz * ssz + pc * ssc + (OFF + offn) * ssn, sc, mask=nmask)
+    cur = kI
+    for t in range(ND):                                          # ND constexpr -> unrolled
+        if t == ND - 1 and NO_CLAMP != 0:
+            d = cur
+        else:
+            lo = cur & ((1 << W) - 1)
+            d = tl.where(lo >= (1 << (W - 1)), lo - (1 << W), lo)
+        pl = (d * (1 << (W * t))).to(tl.bfloat16)
+        tl.store(Kp + pz * spz + t * spt + (OFF + offn)[:, None] * spn + offd[None, :] * spd, pl, mask=m)
+        if t != ND - 1:
+            cur = (cur - d) >> W
+
+
+@triton.jit
+def _enc_v_kernel(V, Vp, Vs, OFF, N_NEW,
+                  svz, svn, svd, spz, spt, spn, spd, ssz, ssc, ssd,
+                  D: tl.constexpr, IB: tl.constexpr, W: tl.constexpr, ND: tl.constexpr,
+                  NO_CLAMP: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr):
+    """Encode one BN-token V chunk x BD dims -> place-folded planes + per-(chunk,dim) scale, in-place
+    at OFF. V scale is per-dim over the BN kv tokens (axis 0), matching encode_kv / the cached kernel."""
+    pc = tl.program_id(0); pd = tl.program_id(1); pz = tl.program_id(2)
+    offn = pc * BN + tl.arange(0, BN); nmask = offn < N_NEW
+    offd = pd * BD + tl.arange(0, BD); dmask = offd < D
+    m = nmask[:, None] & dmask[None, :]
+    v = tl.load(V + pz * svz + offn[:, None] * svn + offd[None, :] * svd, mask=m, other=0.0)
+    sc = _bfp_scale(tl.max(tl.abs(v), axis=0).to(tl.float32), IB)
+    vI = (v / sc[None, :] + tl.where(v >= 0, 0.5, -0.5)).to(tl.int32)
+    vI = tl.minimum(tl.maximum(vI, -(1 << IB)), (1 << IB) - 1)
+    tl.store(Vs + pz * ssz + (OFF // BN + pc) * ssc + offd * ssd, sc, mask=dmask)
+    cur = vI
+    for t in range(ND):
+        if t == ND - 1 and NO_CLAMP != 0:
+            d = cur
+        else:
+            lo = cur & ((1 << W) - 1)
+            d = tl.where(lo >= (1 << (W - 1)), lo - (1 << W), lo)
+        pl = (d * (1 << (W * t))).to(tl.bfloat16)
+        tl.store(Vp + pz * spz + t * spt + (OFF + offn)[:, None] * spn + offd[None, :] * spd, pl, mask=m)
+        if t != ND - 1:
+            cur = (cur - d) >> W
+
+
+def alloc_kv_cache(B, H, N_max, D, nmp, w, nmp_pv=None, w_pv=None, chunk_size=None, block_n=64,
+                   device="cuda"):
+    """Pre-allocate a zeroed KV-plane cache to N_max tokens (for encode_kv_append_fused in-place writes)."""
+    nmp_pv = nmp if nmp_pv is None else nmp_pv
+    w_pv = w if w_pv is None else w_pv
+    Z = B * H
+    nD_qk = oz1fp_params(nmp, w)[0]; nD_pv = oz1fp_params(nmp_pv, w_pv)[0]
+    if chunk_size is not None:
+        block_n = triton.next_power_of_2(chunk_size)
+    KQ = D if chunk_size is None else min(triton.next_power_of_2(chunk_size), D)
+    nchd = (D + KQ - 1) // KQ
+    nch = (N_max + block_n - 1) // block_n
+    return [torch.zeros(Z, nD_qk, N_max, D, device=device, dtype=torch.bfloat16),
+            torch.zeros(Z, nchd, N_max, device=device, dtype=torch.float32),
+            torch.zeros(Z, nD_pv, N_max, D, device=device, dtype=torch.bfloat16),
+            torch.zeros(Z, nch, D, device=device, dtype=torch.float32)]
+
+
+def encode_kv_append_fused(cache, off, k_new, v_new, nmp, w, nmp_pv=None, w_pv=None,
+                           byte_split_style="all_signed_no_clamp", chunk_size=None, block_n=64):
+    """FUSED-triton incremental encode: write new tokens' K/V planes+scales **in-place** into the
+    pre-allocated `cache` (alloc_kv_cache) at kv position `off` -- no torch encode_kv, no O(N) concat,
+    so per-append cost is O(n_new) fused-triton (~tens of us). n_new and off must be block_n-aligned.
+    Bit-identical to encode_kv over the same tokens. Returns off + n_new (the new cache length)."""
+    nmp_pv = nmp if nmp_pv is None else nmp_pv
+    w_pv = w if w_pv is None else w_pv
+    no_clamp = 1 if byte_split_style == "all_signed_no_clamp" else 0
+    B, H, n_new, D = k_new.shape
+    Z = B * H
+    nD_qk = oz1fp_params(nmp, w)[0]; ib_qk = w * nD_qk - 1
+    nD_pv = oz1fp_params(nmp_pv, w_pv)[0]; ib_pv = w_pv * nD_pv - 1
+    if chunk_size is not None:
+        block_n = triton.next_power_of_2(chunk_size)
+    KQ = D if chunk_size is None else min(triton.next_power_of_2(chunk_size), D)
+    nchd = (D + KQ - 1) // KQ
+    assert n_new % block_n == 0 and off % block_n == 0, \
+        f"n_new={n_new} and off={off} must be multiples of block_n={block_n} (V-chunk alignment)"
+    k_pl, k_scale, v_pl, v_scale = cache
+    kz = k_new.reshape(Z, n_new, D).contiguous(); vz = v_new.reshape(Z, n_new, D).contiguous()
+    BLK = 32
+    _enc_k_kernel[(triton.cdiv(n_new, BLK), nchd, Z)](
+        kz, k_pl, k_scale, off, n_new,
+        kz.stride(0), kz.stride(1), kz.stride(2),
+        k_pl.stride(0), k_pl.stride(1), k_pl.stride(2), k_pl.stride(3),
+        k_scale.stride(0), k_scale.stride(1), k_scale.stride(2),
+        D=D, IB=ib_qk, W=w, ND=nD_qk, NO_CLAMP=no_clamp, KQ=KQ, BLK=BLK, num_warps=4)
+    BD = triton.next_power_of_2(D)
+    _enc_v_kernel[(triton.cdiv(n_new, block_n), triton.cdiv(D, BD), Z)](
+        vz, v_pl, v_scale, off, n_new,
+        vz.stride(0), vz.stride(1), vz.stride(2),
+        v_pl.stride(0), v_pl.stride(1), v_pl.stride(2), v_pl.stride(3),
+        v_scale.stride(0), v_scale.stride(1), v_scale.stride(2),
+        D=D, IB=ib_pv, W=w_pv, ND=nD_pv, NO_CLAMP=no_clamp, BN=block_n, BD=BD, num_warps=4)
+    return off + n_new
+
+
 def flash_oz1fp_cg_cached(q, kv, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scale=None,
                           byte_split_style="all_signed_no_clamp", chunk_size=None, BLOCK_M=64, BLOCK_N=64,
                           num_warps=4, num_stages=1):
