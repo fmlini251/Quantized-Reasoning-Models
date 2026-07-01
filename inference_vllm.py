@@ -106,6 +106,10 @@ def parser_gen():
                         help='Enable Ozaki preprocessed-weight caching across forwards (faster but '
                              '~3x weight memory; emulation --weight_cache). Default off: re-encode '
                              'every forward, keeping only the 1x bf16 weight resident (single-GPU safe).')
+    parser.add_argument('--weight_cache_prefill', action='store_true', default=None,
+                        help='Preferred alias for --weight_cache (the linear weight is block-FP '
+                             'encoded once at prefill and reused across all decode steps). Non-breaking: '
+                             '--weight_cache still works and the run-hash key stays "weight_cache".')
     parser.add_argument('--combine_fp64', action='store_true',
                         help='Accumulate the ozaki2_fp place-value combine in fp64 (matches the '
                              'emulation ppl baseline, ~1e-7, ~2x slower). Default is fp32 '
@@ -135,6 +139,10 @@ def parser_gen():
     # YAML base config + CLI override (CLI > YAML > default), mirroring evaluate_ppl.py.
     from emulation.llm.config import apply_yaml_config
     args = apply_yaml_config(parser)
+    # weight_cache_prefill is a non-breaking alias for weight_cache (CLI or YAML); fold it in so the
+    # rest of the pipeline + the run-hash key keep using the canonical "weight_cache".
+    if getattr(args, "weight_cache_prefill", None):
+        args.weight_cache = True
     if args.ozaki_placement == "off":
         args.ozaki_placement = None  # "off" == no Ozaki (plain bf16/fp16); normalize to None
 
