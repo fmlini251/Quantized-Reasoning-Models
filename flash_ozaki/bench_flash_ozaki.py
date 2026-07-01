@@ -2,28 +2,16 @@
 
 Validation: (1) exact mode vs torch exact attention (flash machinery); (2) ozaki mode vs EXACT
 attention across (w,nmp) -> accuracy of fused ozaki1_fp attention.  (GEMM-level fidelity vs the
-production batched_gemm is in oz1fp_triton.py.)
+production batched_gemm is in verification/bench_gemm_vs_production.py.)
 Speed: Flash-Ozaki1_fp vs Flash(exact, same kernel) vs torch SDPA(flash) vs materialized-eager.
 """
-import sys, time
+import sys
 import torch
 
 sys.path.insert(0, "/home/howonlee/Quantized-Reasoning-Models")
-from flash_ozaki.flash_oz1fp_triton import flash_oz1fp
+from flash_ozaki.flash_oz1fp_codegen import flash_oz1fp_cg
 from flash_ozaki.oz1fp_triton import oz1fp_params
-
-
-def relerr(a, b):
-    return (a.float() - b.float()).norm().item() / (b.float().norm().item() + 1e-12)
-
-
-def exact_attn(q, k, v, causal=True):
-    B, H, N, D = q.shape
-    s = (q.float() @ k.float().transpose(-1, -2)) / (D ** 0.5)
-    if causal:
-        m = torch.tril(torch.ones(N, N, device=q.device, dtype=torch.bool))
-        s = s.masked_fill(~m, -float("inf"))
-    return torch.softmax(s, -1) @ v.float()
+from flash_ozaki._testutil import relerr, exact_attn, do_bench
 
 
 def materialized_ozaki_eager(q, k, v, nmp, w, causal=True):
@@ -48,17 +36,6 @@ def materialized_ozaki_eager(q, k, v, nmp, w, causal=True):
     return o.reshape(B, H, N, D)
 
 
-def do_bench(fn, n=30, warmup=10):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(n):
-        fn()
-    torch.cuda.synchronize()
-    return (time.perf_counter() - t0) / n * 1e3
-
-
 def main():
     dev = "cuda"; torch.manual_seed(0)
     H, D, causal = 28, 128, True
@@ -68,11 +45,11 @@ def main():
     k = torch.randn(B, H, N, D, device=dev, dtype=torch.bfloat16)
     v = torch.randn(B, H, N, D, device=dev, dtype=torch.bfloat16)
     ex = exact_attn(q, k, v, causal)
-    o_fp = flash_oz1fp(q, k, v, nmp=1, w=8, causal=causal, ozaki=False)
+    o_fp = flash_oz1fp_cg(q, k, v, nmp=1, w=8, causal=causal, ozaki=False)
     print(f"  exact-mode kernel vs torch exact: rel-err = {relerr(o_fp, ex):.2e}  (flash machinery)")
     print(f"  {'config':>16} | {'fused vs EXACT':>14} | {'eager-ref vs EXACT':>18} | {'fused vs eager-ref':>18}")
     for (w, nmp) in [(8, 1), (4, 4), (4, 9), (4, 10), (4, 15)]:
-        oz = flash_oz1fp(q, k, v, nmp=nmp, w=w, causal=causal, ozaki=True)
+        oz = flash_oz1fp_cg(q, k, v, nmp=nmp, w=w, causal=causal, ozaki=True)
         try:
             eg = materialized_ozaki_eager(q, k, v, nmp=nmp, w=w, causal=causal)
             s2 = f"{relerr(eg,ex):18.2e} | {relerr(oz,eg):18.2e}"
@@ -87,8 +64,8 @@ def main():
         q = torch.randn(B, H, N, D, device=dev, dtype=torch.bfloat16)
         k = torch.randn(B, H, N, D, device=dev, dtype=torch.bfloat16)
         v = torch.randn(B, H, N, D, device=dev, dtype=torch.bfloat16)
-        t_oz = do_bench(lambda: flash_oz1fp(q, k, v, nmp=10, w=4, causal=causal, ozaki=True))
-        t_fp = do_bench(lambda: flash_oz1fp(q, k, v, nmp=1, w=8, causal=causal, ozaki=False))
+        t_oz = do_bench(lambda: flash_oz1fp_cg(q, k, v, nmp=10, w=4, causal=causal, ozaki=True))
+        t_fp = do_bench(lambda: flash_oz1fp_cg(q, k, v, nmp=1, w=8, causal=causal, ozaki=False))
         t_sd = do_bench(lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal))
         try:
             t_eg = do_bench(lambda: materialized_ozaki_eager(q, k, v, nmp=10, w=4, causal=causal), n=8, warmup=3)
@@ -96,6 +73,43 @@ def main():
         except RuntimeError:
             eg = f"{'OOM':>23}"
         print(f"{N:6} | {t_oz:15.2f} | {t_fp:21.2f} | {t_sd:11.2f} | {eg}")
+
+    decode_gqa()
+
+
+def decode_gqa():
+    """Decode (q_len=1) + GQA head-folding. The G query heads sharing a kv head are folded into the
+    query-row (M) dim so one loaded K/V tile feeds all G heads (QK^T becomes a [G,D] GEMM, not a
+    [1,D] GEMV). Validates accuracy (= prefill ozaki1_fp) and the batched-decode speedup vs replicating
+    K/V to all H query heads (the win is the ~G× KV reuse, realized once B*Hkv fills the GPU)."""
+    dev = "cuda"; torch.manual_seed(0)
+    Hq, Hkv, D = 28, 4, 128          # Qwen-7B GQA shape -> G=7
+    G = Hq // Hkv                    # exact reference (GQA + decode positions) = _testutil.exact_attn
+
+    print(f"\n=== Decode + GQA fold (Hq={Hq}/Hkv={Hkv}, G={G}, D={D}); fused vs EXACT ===")
+    print(f"  {'config':>22} | {'MHA decode (G=1)':>16} | {'GQA decode (fold)':>17}")
+    N = 2048
+    for (w, nmp) in [(8, 1), (4, 9), (4, 10), (4, 15)]:
+        qg = torch.randn(1, Hq, 1, D, device=dev, dtype=torch.bfloat16)
+        kg = torch.randn(1, Hkv, N, D, device=dev, dtype=torch.bfloat16)
+        vg = torch.randn(1, Hkv, N, D, device=dev, dtype=torch.bfloat16)
+        o_gqa = flash_oz1fp_cg(qg, kg, vg, nmp=nmp, w=w, causal=True, ozaki=True)
+        r_gqa = relerr(o_gqa, exact_attn(qg, kg, vg))
+        km, vm = (t.repeat_interleave(G, dim=1).contiguous() for t in (kg, vg))   # MHA: replicate to Hq
+        o_mha = flash_oz1fp_cg(qg, km, vm, nmp=nmp, w=w, causal=True, ozaki=True)
+        r_mha = relerr(o_mha, exact_attn(qg, kg, vg))
+        print(f"  w={w} nmp={nmp:<2}(nD={oz1fp_params(nmp, w)[0]}) | {r_mha:16.2e} | {r_gqa:17.2e}")
+
+    print(f"\n=== Batched decode q_len=1 (N={N}, w4 nmp10): GQA-fold vs replicate-to-MHA ===")
+    print(f"{'B':>4} | {'progs(B*Hkv)':>12} | {'GQA-fold ms':>11} | {'replicate ms':>12} | {'speedup':>8}")
+    for B in [1, 8, 32, 64]:
+        qg = torch.randn(B, Hq, 1, D, device=dev, dtype=torch.bfloat16)
+        kg = torch.randn(B, Hkv, N, D, device=dev, dtype=torch.bfloat16)
+        vg = torch.randn(B, Hkv, N, D, device=dev, dtype=torch.bfloat16)
+        km, vm = (t.repeat_interleave(G, dim=1).contiguous() for t in (kg, vg))
+        tf = do_bench(lambda: flash_oz1fp_cg(qg, kg, vg, nmp=10, w=4, causal=True, ozaki=True))
+        tr = do_bench(lambda: flash_oz1fp_cg(qg, km, vm, nmp=10, w=4, causal=True, ozaki=True))
+        print(f"{B:4} | {B*Hkv:12} | {tf:11.3f} | {tr:12.3f} | {tr/tf:7.2f}x")
 
 
 if __name__ == "__main__":

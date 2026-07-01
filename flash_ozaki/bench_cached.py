@@ -1,61 +1,46 @@
-"""Measure the kv_cache=True speedup for Flash-Ozaki1_fp (GPU 0). The cache (pre-encoded K/V
-digit planes + scales) is built ONCE (amortized, like weight_cache); we time only the flash kernel."""
-import sys, time
+"""Pre-encoded KV cache (attention analog of weight_cache), EXACT vs non-cached ozaki1_fp (codegen
+path): cache format/memory + accuracy (vs fp32 exact and vs the non-cached kernel), prefill + decode
+(MHA and GQA head-fold). K/V are block-FP-encoded ONCE into place-folded digit planes; the flash
+kernel loads them and skips the per-tile K/V amax+round+split+cast. Run from repo root:
+    CUDA_VISIBLE_DEVICES=0 python flash_ozaki/bench_cached.py"""
+import sys
 import torch
 sys.path.insert(0, "/home/howonlee/Quantized-Reasoning-Models")
-from flash_ozaki.flash_oz1fp_triton import flash_oz1fp
-from flash_ozaki.flash_oz1fp_cached import flash_oz1fp_cached, encode_kv
+from flash_ozaki.flash_oz1fp_codegen import flash_oz1fp_cg, flash_oz1fp_cg_cached, encode_kv
 from flash_ozaki.oz1fp_triton import oz1fp_params
-
-
-def relerr(a, b):
-    return (a.float() - b.float()).norm().item() / (b.float().norm().item() + 1e-12)
-
-
-def exact_attn(q, k, v, causal=True):
-    B, H, N, D = q.shape
-    s = (q.float() @ k.float().transpose(-1, -2)) / (D ** 0.5)
-    if causal:
-        m = torch.tril(torch.ones(N, N, device=q.device, dtype=torch.bool))
-        s = s.masked_fill(~m, -float("inf"))
-    return torch.softmax(s, -1) @ v.float()
-
-
-def do_bench(fn, n=30, warmup=10):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(n):
-        fn()
-    torch.cuda.synchronize()
-    return (time.perf_counter() - t0) / n * 1e3
+from flash_ozaki._testutil import relerr, exact_attn, do_bench, cache_mb
 
 
 dev = "cuda"; torch.manual_seed(0)
-B, H, D, causal = 1, 28, 128, True
-
-print("=== Accuracy: cached vs non-cached vs EXACT (N=1024) ===")
-N = 1024
+B, H, D, N = 1, 28, 128, 2048
 q = torch.randn(B, H, N, D, device=dev, dtype=torch.bfloat16)
 k = torch.randn(B, H, N, D, device=dev, dtype=torch.bfloat16)
 v = torch.randn(B, H, N, D, device=dev, dtype=torch.bfloat16)
-ex = exact_attn(q, k, v, causal)
-for (w, nmp) in [(8, 1), (4, 10)]:
-    nc = flash_oz1fp(q, k, v, nmp=nmp, w=w, causal=causal, ozaki=True)
-    kv = encode_kv(k, v, nmp, w)
-    cc = flash_oz1fp_cached(q, kv, nmp=nmp, w=w, causal=causal)
-    print(f"  w={w} nmp={nmp:<2}: cached vs EXACT={relerr(cc,ex):.2e}  non-cached vs EXACT={relerr(nc,ex):.2e}  cached vs non-cached={relerr(cc,nc):.2e}")
+ex = exact_attn(q, k, v, True)
 
-for (w, nmp) in [(8, 1), (4, 10)]:
-    print(f"\n=== Speed w={w} nmp={nmp} (nD={oz1fp_params(nmp,w)[0]}); ms/call; cache pre-built ===")
-    print(f"{'N_ctx':>6} | {'cached (kv_cache=T)':>19} | {'non-cached':>11} | {'exact flash':>11} | {'cache/noncache':>14} | {'cache/exact':>11}")
-    for N in [1024, 2048, 4096]:
-        q = torch.randn(B, H, N, D, device=dev, dtype=torch.bfloat16)
-        k = torch.randn(B, H, N, D, device=dev, dtype=torch.bfloat16)
-        v = torch.randn(B, H, N, D, device=dev, dtype=torch.bfloat16)
-        kv = encode_kv(k, v, nmp, w)                          # one-time cache build (not timed)
-        t_cc = do_bench(lambda: flash_oz1fp_cached(q, kv, nmp=nmp, w=w, causal=causal))
-        t_nc = do_bench(lambda: flash_oz1fp(q, k, v, nmp=nmp, w=w, causal=causal, ozaki=True))
-        t_ex = do_bench(lambda: flash_oz1fp(q, k, v, nmp=1, w=8, causal=causal, ozaki=False))
-        print(f"{N:6} | {t_cc:19.2f} | {t_nc:11.2f} | {t_ex:11.2f} | {t_nc/t_cc:13.2f}x | {t_cc/t_ex:10.2f}x")
+print(f"=== EXACT digit-plane KV cache (N={N}, H={H}, D={D}, causal) ===")
+print(f"{'cfg':>9} | {'planes(K/V)':>11} | {'cache MB':>8} | {'cached vs EXACT':>15} | "
+      f"{'cached vs non-cache':>19} | {'ms cached/non-cache':>19}")
+for (w, nmp) in [(4, 9), (4, 16), (4, 10), (4, 15)]:
+    nD, drop, _ = oz1fp_params(nmp, w)
+    kv = encode_kv(k, v, nmp, w)                          # (k_pl, k_scale, v_pl, v_scale), exact planes
+    o_c = flash_oz1fp_cg_cached(q, kv, nmp, w)
+    nc = flash_oz1fp_cg(q, k, v, nmp, w)                  # non-cached exact ozaki1_fp
+    t_c = do_bench(lambda: flash_oz1fp_cg_cached(q, kv, nmp, w))
+    t_nc = do_bench(lambda: flash_oz1fp_cg(q, k, v, nmp, w))
+    print(f"  w{w} nmp{nmp:<2} | {nD:5}/{nD:<5} | {cache_mb(kv):8.1f} | {relerr(o_c,ex):15.2e} | "
+          f"{relerr(o_c,nc):19.2e} | {t_c:8.2f}/{t_nc:8.2f}")
+print("\ncached == non-cached up to fp32 accumulation order; the cache trades memory (nD planes) for "
+      "skipping the per-tile K/V encode -- the decode win below.")
+
+# --- decode (q_len=1) against the cache: MHA + GQA fold (the cache is the real decode win) ---
+Hkv = 4; G = H // Hkv                                     # Qwen-7B GQA shape (28/4 -> G=7)
+print(f"\n=== Decode q_len=1 against the cache (N={N}, w4 nmp9) ===")
+qd = torch.randn(B, H, 1, D, device=dev, dtype=torch.bfloat16)                # 28 query heads, 1 token
+ex_d = exact_attn(qd, k, v, True)                                            # MHA exact decode
+kg = k.reshape(B, Hkv, G, N, D)[:, :, 0]; vg = v.reshape(B, Hkv, G, N, D)[:, :, 0]   # 4 kv heads
+ex_g = exact_attn(qd, kg, vg, True)                                          # GQA exact (fold-aware)
+o_mha = flash_oz1fp_cg_cached(qd, encode_kv(k, v, 9, 4), 9, 4)               # cache has H=28 kv heads
+o_gqa = flash_oz1fp_cg_cached(qd, encode_kv(kg, vg, 9, 4), 9, 4)             # cache has Hkv=4 kv heads
+print(f"  MHA decode (cache 28 kv heads): cached vs EXACT = {relerr(o_mha, ex_d):.2e}")
+print(f"  GQA decode (cache  4 kv heads, G=7 fold): cached vs EXACT = {relerr(o_gqa, ex_g):.2e}")
