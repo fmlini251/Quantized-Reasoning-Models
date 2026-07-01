@@ -276,12 +276,16 @@ def _gen_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
     src = f'''
 @triton.jit
 def _flash_cg(
-    Q, K, V, Out, sm_scale, Z, N_CTX, Q_LEN, Q_OFF,
+    Q, K, V, Out, sm_scale, Z, N_CTX, Q_LEN, Q_OFF, KVLEN,
     sqz, sqn, sqd, skz, skn, skd, svz, svn, svd, soz, son, sod,
     HEAD_DIM: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    CAUSAL: tl.constexpr, GQA_G: tl.constexpr, KQ: tl.constexpr,
+    CAUSAL: tl.constexpr, GQA_G: tl.constexpr, KQ: tl.constexpr, HAS_KVLEN: tl.constexpr,
 ):
     pid_m = tl.program_id(0); pid_z = tl.program_id(1)
+    if HAS_KVLEN:                                     # per-batch valid kv length (vLLM padded decode)
+        kvlen = tl.load(KVLEN + pid_z)
+    else:
+        kvlen = N_CTX
     offm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offd = tl.arange(0, BLOCK_D)
     dmask = offd < HEAD_DIM
@@ -293,12 +297,12 @@ def _flash_cg(
     acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
     if CAUSAL:
         last_m = tl.minimum((pid_m + 1) * BLOCK_M, Q_LEN) - 1
-        n_end = tl.minimum(Q_OFF + last_m // GQA_G + 1, N_CTX)
+        n_end = tl.minimum(Q_OFF + last_m // GQA_G + 1, kvlen)
     else:
-        n_end = N_CTX
+        n_end = kvlen
     for n0 in range(0, n_end, BLOCK_N):
         offn = n0 + tl.arange(0, BLOCK_N)
-        nmask = offn < N_CTX
+        nmask = offn < kvlen
 {qk_body}
 {tail}
     acc = acc / l_i[:, None]
@@ -327,15 +331,19 @@ def _get_kernel(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
 
 @triton.jit
 def _flash_exact_fwd(
-    Q, K, V, Out, sm_scale, Z, N_CTX, Q_LEN, Q_OFF,
+    Q, K, V, Out, sm_scale, Z, N_CTX, Q_LEN, Q_OFF, KVLEN,
     sqz, sqn, sqd, skz, skn, skd, svz, svn, svd, soz, son, sod,
     HEAD_DIM: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    CAUSAL: tl.constexpr, GQA_G: tl.constexpr, KQ: tl.constexpr,
+    CAUSAL: tl.constexpr, GQA_G: tl.constexpr, KQ: tl.constexpr, HAS_KVLEN: tl.constexpr,
 ):
     """Plain bf16 flash attention (no ozaki) -- the flash-exact baseline the benches compare against.
     Same online-softmax / causal / GQA-fold structure as the generated ozaki kernel, so the two are
     apples-to-apples; only the QK/PV dots differ (single bf16 dot vs digit-plane plan)."""
     pid_m = tl.program_id(0); pid_z = tl.program_id(1)
+    if HAS_KVLEN:                                     # per-batch valid kv length (vLLM padded decode)
+        kvlen = tl.load(KVLEN + pid_z)
+    else:
+        kvlen = N_CTX
     offm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offd = tl.arange(0, BLOCK_D)
     dmask = offd < HEAD_DIM
@@ -346,12 +354,12 @@ def _flash_exact_fwd(
     acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
     if CAUSAL:
         last_m = tl.minimum((pid_m + 1) * BLOCK_M, Q_LEN) - 1
-        n_end = tl.minimum(Q_OFF + last_m // GQA_G + 1, N_CTX)
+        n_end = tl.minimum(Q_OFF + last_m // GQA_G + 1, kvlen)
     else:
-        n_end = N_CTX
+        n_end = kvlen
     for n0 in range(0, n_end, BLOCK_N):
         offn = n0 + tl.arange(0, BLOCK_N)
-        nmask = offn < N_CTX
+        nmask = offn < kvlen
         k = tl.load(K + pid_z * skz + offn[:, None] * skn + offd[None, :] * skd,
                     mask=nmask[:, None] & dmask[None, :], other=0.0)
         qk = tl.dot(q, tl.trans(k)) * sm_scale
@@ -373,7 +381,7 @@ def _flash_exact_fwd(
 
 def flash_oz1fp_cg(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scale=None, ozaki=True,
                    byte_split_style="all_signed_no_clamp", chunk_size=None, BLOCK_M=64, BLOCK_N=64,
-                   num_warps=4, num_stages=1):
+                   num_warps=4, num_stages=1, kv_lens=None):
     """Code-generated Flash-Ozaki1_fp. q:[B,Hq,T,D]; k,v:[B,Hkv,N,D] bf16 (MHA Hq==Hkv; GQA Hq=Hkv*G
     folds the G group-heads into the query-row dim). nmp/w drive QK^T; nmp_pv/w_pv (default = nmp/w)
     drive P@V INDEPENDENTLY -- QK-nmp != PV-nmp is supported. Optimal pack plan + single-peel planes
@@ -383,7 +391,11 @@ def flash_oz1fp_cg(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scal
     chunk_size: the block-FP chunk applied to EVERY GEMM reduction, matching production. QK's head_dim
     reduction is split into KQ=next_pow2(min(chunk_size,D))-wide chunks, and PV's kv reduction chunk is
     the kv tile, so BLOCK_N is set to next_pow2(chunk_size). chunk_size=None keeps the fast un-chunked
-    path (QK: one block-FP scale over the full head_dim; PV: chunk = BLOCK_N). Best power-of-2."""
+    path (QK: one block-FP scale over the full head_dim; PV: chunk = BLOCK_N). Best power-of-2.
+
+    kv_lens: optional int tensor [B] of the valid kv length per batch element. When given, kv positions
+    >= kv_lens[b] are masked out (score -inf) -- for vLLM decode where K/V are gathered/padded to a
+    shared max length but each sequence attends only its own prefix. None => all N positions valid."""
     nmp_pv = nmp if nmp_pv is None else nmp_pv
     w_pv = w if w_pv is None else w_pv
     no_clamp = 1 if byte_split_style == "all_signed_no_clamp" else 0
@@ -407,14 +419,18 @@ def flash_oz1fp_cg(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scal
     BLOCK_M = max(16, min(BLOCK_M, triton.next_power_of_2(Qrows)))
     o = torch.empty_like(qz)
     kern = _get_kernel(nmp, w, nmp_pv, w_pv, no_clamp, chunked) if ozaki else _flash_exact_fwd
+    has_kvlen = kv_lens is not None
+    # expand per-batch [B] valid-length to [B*Hkv] so program pid_z (=(b,hkv)) indexes it directly.
+    kvlen_z = (kv_lens.to(device=q.device, dtype=torch.int32).reshape(B).repeat_interleave(Hkv).contiguous()
+               if has_kvlen else qz)          # dummy ptr when absent; HAS_KVLEN=False so never loaded
 
     def _launch(bm):
         kern[(triton.cdiv(Qrows, bm), B * Hkv)](
-            qz, kz, vz, o, sm_scale, B * Hkv, N, Qrows, N - T,
+            qz, kz, vz, o, sm_scale, B * Hkv, N, Qrows, N - T, kvlen_z,
             qz.stride(0), qz.stride(1), qz.stride(2), kz.stride(0), kz.stride(1), kz.stride(2),
             vz.stride(0), vz.stride(1), vz.stride(2), o.stride(0), o.stride(1), o.stride(2),
             HEAD_DIM=D, BLOCK_D=triton.next_power_of_2(D), BLOCK_M=bm, BLOCK_N=BLOCK_N,
-            CAUSAL=causal, GQA_G=G, KQ=KQ, num_warps=num_warps, num_stages=num_stages,
+            CAUSAL=causal, GQA_G=G, KQ=KQ, HAS_KVLEN=has_kvlen, num_warps=num_warps, num_stages=num_stages,
         )
     _run_with_oom_retry(_launch, BLOCK_M)
     if G == 1:
@@ -503,13 +519,17 @@ def _gen_cached_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
     src = f'''
 @triton.jit
 def _flash_cg_cached(
-    Q, Kp, Ks, Vp, Vs, Out, sm_scale, Z, N_CTX, Q_LEN, Q_OFF,
+    Q, Kp, Ks, Vp, Vs, Out, sm_scale, Z, N_CTX, Q_LEN, Q_OFF, KVLEN,
     sqz, sqn, sqd, skz, skt, skn, skd, sksz, skscd, sksn,
     svz, svt, svn, svd, svsz, svsc, svsd, soz, son, sod,
     HEAD_DIM: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    CAUSAL: tl.constexpr, GQA_G: tl.constexpr, KQ: tl.constexpr,
+    CAUSAL: tl.constexpr, GQA_G: tl.constexpr, KQ: tl.constexpr, HAS_KVLEN: tl.constexpr,
 ):
     pid_m = tl.program_id(0); pid_z = tl.program_id(1)
+    if HAS_KVLEN:                                     # per-batch valid kv length (vLLM padded decode)
+        kvlen = tl.load(KVLEN + pid_z)
+    else:
+        kvlen = N_CTX
     offm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offd = tl.arange(0, BLOCK_D)
     dmask = offd < HEAD_DIM
@@ -521,12 +541,12 @@ def _flash_cg_cached(
     acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
     if CAUSAL:
         last_m = tl.minimum((pid_m + 1) * BLOCK_M, Q_LEN) - 1
-        n_end = tl.minimum(Q_OFF + last_m // GQA_G + 1, N_CTX)
+        n_end = tl.minimum(Q_OFF + last_m // GQA_G + 1, kvlen)
     else:
-        n_end = N_CTX
+        n_end = kvlen
     for n0 in range(0, n_end, BLOCK_N):
         offn = n0 + tl.arange(0, BLOCK_N)
-        nmask = offn < N_CTX
+        nmask = offn < kvlen
 {qk_body}
 {tail}
     acc = acc / l_i[:, None]
@@ -732,7 +752,7 @@ def encode_kv_append_fused(cache, off, k_new, v_new, nmp, w, nmp_pv=None, w_pv=N
 
 def flash_oz1fp_cg_cached(q, kv, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scale=None,
                           byte_split_style="all_signed_no_clamp", chunk_size=None, BLOCK_M=64, BLOCK_N=64,
-                          num_warps=4, num_stages=1):
+                          num_warps=4, num_stages=1, kv_lens=None):
     """Cached-KV codegen flash. q:[B,Hq,T,D]; kv = encode_kv(..., chunk_size=chunk_size) (Hkv kv heads,
     length N). MHA: Hq==Hkv. GQA: Hq=Hkv*G -> the G query heads sharing each cached kv head fold into
     the query-row dim, so one cache tile feeds all G. Prefill T==N; decode/chunked T<N (q token i at abs
@@ -772,10 +792,13 @@ def flash_oz1fp_cg_cached(q, kv, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm
     BLOCK_M = max(16, min(BLOCK_M, triton.next_power_of_2(Qrows)))
     o = torch.empty_like(qz)
     kern = _get_cached_kernel(nmp, w, nmp_pv, w_pv, no_clamp, chunked)
+    has_kvlen = kv_lens is not None
+    kvlen_z = (kv_lens.to(device=q.device, dtype=torch.int32).reshape(B).repeat_interleave(Hkv).contiguous()
+               if has_kvlen else qz)          # dummy ptr when absent; HAS_KVLEN=False so never loaded
 
     def _launch(bm):
         kern[(triton.cdiv(Qrows, bm), Zc)](
-            qz, k_pl, k_scale, v_pl, v_scale, o, sm_scale, Zc, N, Qrows, N - T,
+            qz, k_pl, k_scale, v_pl, v_scale, o, sm_scale, Zc, N, Qrows, N - T, kvlen_z,
             qz.stride(0), qz.stride(1), qz.stride(2),
             k_pl.stride(0), k_pl.stride(1), k_pl.stride(2), k_pl.stride(3),
             k_scale.stride(0), k_scale.stride(1), k_scale.stride(2),
@@ -783,7 +806,7 @@ def flash_oz1fp_cg_cached(q, kv, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm
             v_scale.stride(0), v_scale.stride(1), v_scale.stride(2),
             o.stride(0), o.stride(1), o.stride(2),
             HEAD_DIM=D, BLOCK_D=triton.next_power_of_2(D), BLOCK_M=bm, BLOCK_N=BLOCK_N,
-            CAUSAL=causal, GQA_G=G, KQ=KQ, num_warps=num_warps, num_stages=num_stages,
+            CAUSAL=causal, GQA_G=G, KQ=KQ, HAS_KVLEN=has_kvlen, num_warps=num_warps, num_stages=num_stages,
         )
     _run_with_oom_retry(_launch, BLOCK_M)
     if G == 1:

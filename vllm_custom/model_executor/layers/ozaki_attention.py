@@ -152,9 +152,15 @@ def _gather_kv_from_cache(key_cache, value_cache, block_table, seq_len, num_kv_h
 
 def install_ozaki_attention_backend(nmp=None, chunk_size=32, rslt_type="ozaki1_fp", s=None,
                                     scale_method="new_compressed", shift_bits=7, M_frac_bits=8,
-                                    gemm_bits=8, byte_split_style="all_signed_clamp_pos"):
+                                    gemm_bits=8, byte_split_style="all_signed_clamp_pos", flash=None):
     """Monkeypatch vLLM's attention-backend selector to return OzakiAttentionBackend.
-    Call BEFORE the LLM is built (attention layers resolve the backend at construction)."""
+    Call BEFORE the LLM is built (attention layers resolve the backend at construction).
+
+    flash: None (default) leaves OZAKI_ATTN_FLASH as-is; True/False sets it. When enabled (and
+    rslt_type==ozaki1_fp) attention runs through the Triton flash_ozaki kernel (online-softmax,
+    non-cached, GQA-fold) instead of the eager batched_gemm path -- same ozaki1_fp math, ~e-3 apart."""
+    if flash is not None:
+        os.environ["OZAKI_ATTN_FLASH"] = "1" if flash else "0"
     if nmp is not None:
         set_ozaki_attention_params(nmp, chunk_size, rslt_type, s, scale_method, shift_bits,
                                    M_frac_bits, gemm_bits, byte_split_style)
@@ -223,14 +229,29 @@ class OzakiAttentionImpl(XFormersImpl):
                 shift_bits=p.get("shift_bits", 7), M_frac_bits=p.get("M_frac_bits", 8),
                 gemm_bits=p.get("gemm_bits", 8),
                 byte_split_style=p.get("byte_split_style", "all_signed_clamp_pos"))
+            self._oz_p = p
+            # Flash path (Triton flash_ozaki kernel): opt-in via OZAKI_ATTN_FLASH=1, ozaki1_fp only
+            # (the flash codegen kernel emulates the bf16 ozaki1_fp datapath; ozaki2_fp/RNS stays eager).
+            self._oz_flash = (os.environ.get("OZAKI_ATTN_FLASH", "0") == "1"
+                              and p["rslt_type"] == "ozaki1_fp")
             global _OZAKI_ATTN_ANNOUNCED
             if not _OZAKI_ATTN_ANNOUNCED:
                 _OZAKI_ATTN_ANNOUNCED = True
                 # WARNING level so it propagates from spawned TP workers (per-process, once).
                 import logging
                 logging.getLogger("vllm").warning(
-                    "[Ozaki] OzakiAttentionImpl ACTIVE in pid=%d (nmp=%s, rslt=%s) -- "
-                    "attention QK^T/PV via ozaki", os.getpid(), p["nmp"], p["rslt_type"])
+                    "[Ozaki] OzakiAttentionImpl ACTIVE in pid=%d (nmp=%s, rslt=%s, mode=%s) -- "
+                    "attention QK^T/PV via ozaki", os.getpid(), p["nmp"], p["rslt_type"],
+                    "flash" if self._oz_flash else "eager")
+
+    def _flash(self, q4, k4, v4, kv_lens=None):
+        """Ozaki1_fp Triton flash kernel. q4:[B,Hq,T,D]; k4,v4:[B,Hkv,N,D] (GQA folded internally).
+        Causal online-softmax; kv_lens[B] masks padded decode positions. Returns [B,Hq,T,D]."""
+        from flash_ozaki.flash_oz1fp_codegen import flash_oz1fp_cg
+        p = self._oz_p
+        return flash_oz1fp_cg(q4, k4, v4, nmp=p["nmp"], w=p["gemm_bits"], causal=True,
+                              sm_scale=self.scale, chunk_size=p["chunk_size"],
+                              byte_split_style=p["byte_split_style"], kv_lens=kv_lens)
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata, output=None):
         assert self.attn_type == AttentionType.DECODER, \
@@ -268,17 +289,24 @@ class OzakiAttentionImpl(XFormersImpl):
             qp = query.new_zeros(P, Lm, nH, hd);  qp[seq_id, posn] = query[:nq]
             kp = key.new_zeros(P, Lm, nKV, hd);   kp[seq_id, posn] = key[:nkv]
             vp = value.new_zeros(P, Lm, nKV, hd); vp[seq_id, posn] = value[:nkv]
-            q = qp.permute(0, 2, 1, 3).reshape(P * nH, Lm, hd)
-            k = kp.repeat_interleave(groups, 2).permute(0, 2, 1, 3).reshape(P * nH, Lm, hd)
-            v = vp.repeat_interleave(groups, 2).permute(0, 2, 1, 3).reshape(P * nH, Lm, hd)
-            aw = _ozaki_eager_attention(q, k, v, self.scale, gcfg, oz, layer.layer_name)
-            aw = aw.view(P, nH, Lm, Lm).float()
-            ar = torch.arange(Lm, device=dev)
-            allow = (ar[None, :] <= ar[:, None])[None] & (ar[None, :] < lens[:, None])[:, None, :]  # [P,Lm,Lm]
-            aw = aw.masked_fill(~allow[:, None], NEG)
-            aw = nn.functional.softmax(aw, dim=-1).to(q.dtype).view(P * nH, Lm, Lm)
-            o = _ozaki_pv(aw, v, gcfg, oz, layer.layer_name).view(P, nH, Lm, hd).permute(0, 2, 1, 3)
-            out[:nq] = o[seq_id, posn]
+            if self._oz_flash:
+                # Flash: causal alone is correct here -- a valid query at posn<lens attends only kv<=posn
+                # (all valid); padded query rows (posn>=lens) are computed but discarded by the index below.
+                o4 = self._flash(qp.permute(0, 2, 1, 3), kp.permute(0, 2, 1, 3),
+                                 vp.permute(0, 2, 1, 3))                    # [P,nH,Lm,hd]
+                out[:nq] = o4.permute(0, 2, 1, 3)[seq_id, posn]
+            else:
+                q = qp.permute(0, 2, 1, 3).reshape(P * nH, Lm, hd)
+                k = kp.repeat_interleave(groups, 2).permute(0, 2, 1, 3).reshape(P * nH, Lm, hd)
+                v = vp.repeat_interleave(groups, 2).permute(0, 2, 1, 3).reshape(P * nH, Lm, hd)
+                aw = _ozaki_eager_attention(q, k, v, self.scale, gcfg, oz, layer.layer_name)
+                aw = aw.view(P, nH, Lm, Lm).float()
+                ar = torch.arange(Lm, device=dev)
+                allow = (ar[None, :] <= ar[:, None])[None] & (ar[None, :] < lens[:, None])[:, None, :]  # [P,Lm,Lm]
+                aw = aw.masked_fill(~allow[:, None], NEG)
+                aw = nn.functional.softmax(aw, dim=-1).to(q.dtype).view(P * nH, Lm, Lm)
+                o = _ozaki_pv(aw, v, gcfg, oz, layer.layer_name).view(P, nH, Lm, hd).permute(0, 2, 1, 3)
+                out[:nq] = o[seq_id, posn]
 
         # ===== Decode: gather each seq's K/V from the paged cache + GQA-grouped batched_gemm,
         # processed in MINI-BATCHES of seqs so the pad-to-max gather/scores stay bounded at
@@ -309,15 +337,23 @@ class OzakiAttentionImpl(XFormersImpl):
                 bf, of = blk.reshape(-1), off.reshape(-1)
                 K = key_cache[bf, :, :, of, :].reshape(d, Lm, nKV, hd)     # invert paged layout, batched
                 V = value_cache[bf, :, :, of].reshape(d, Lm, nKV, hd)
-                # GQA-grouped: keep K/V at nKV heads (do NOT repeat to nH); treat each KV
-                # head's `groups` query heads as the GEMM row dim (identical, nH/nKV less mem).
-                q = dq.reshape(d, nKV, groups, hd).reshape(d * nKV, groups, hd)
-                k = K.permute(0, 2, 1, 3).reshape(d * nKV, Lm, hd)
-                v = V.permute(0, 2, 1, 3).reshape(d * nKV, Lm, hd)
-                aw = _ozaki_eager_attention(q, k, v, self.scale, gcfg, oz, layer.layer_name)
-                aw = aw.view(d, nKV, groups, Lm).float().masked_fill(~valid[:, None, None, :], NEG)
-                aw = nn.functional.softmax(aw, dim=-1).to(q.dtype).reshape(d * nKV, groups, Lm)
-                o = _ozaki_pv(aw, v, gcfg, oz, layer.layer_name)
-                out[nq + s0:nq + e0] = o.view(d, nKV, groups, hd).reshape(d, nH, hd)
+                if self._oz_flash:
+                    # Flash handles GQA fold internally; kv_lens masks the padded tail per seq (K/V beyond
+                    # seq_len were gathered from clamped/garbage slots but n_end+mask never touch them).
+                    o4 = self._flash(dq[:, :, None, :],                        # [d,nH,1,hd]
+                                     K.permute(0, 2, 1, 3), V.permute(0, 2, 1, 3),  # [d,nKV,Lm,hd]
+                                     kv_lens=seq_lens)                         # [d,nH,1,hd]
+                    out[nq + s0:nq + e0] = o4.reshape(d, nH, hd)
+                else:
+                    # GQA-grouped: keep K/V at nKV heads (do NOT repeat to nH); treat each KV
+                    # head's `groups` query heads as the GEMM row dim (identical, nH/nKV less mem).
+                    q = dq.reshape(d, nKV, groups, hd).reshape(d * nKV, groups, hd)
+                    k = K.permute(0, 2, 1, 3).reshape(d * nKV, Lm, hd)
+                    v = V.permute(0, 2, 1, 3).reshape(d * nKV, Lm, hd)
+                    aw = _ozaki_eager_attention(q, k, v, self.scale, gcfg, oz, layer.layer_name)
+                    aw = aw.view(d, nKV, groups, Lm).float().masked_fill(~valid[:, None, None, :], NEG)
+                    aw = nn.functional.softmax(aw, dim=-1).to(q.dtype).reshape(d * nKV, groups, Lm)
+                    o = _ozaki_pv(aw, v, gcfg, oz, layer.layer_name)
+                    out[nq + s0:nq + e0] = o.view(d, nKV, groups, hd).reshape(d, nH, hd)
 
         return out.view(-1, nH * hd)
