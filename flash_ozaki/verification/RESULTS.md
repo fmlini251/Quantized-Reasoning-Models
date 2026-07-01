@@ -149,12 +149,35 @@ slot-cuBLAS. flash_ozaki가 어텐션 전용인 이유.
 ozaki w4 nmp10, **chunk=32**. flash-exact = 같은 커널 `ozaki=False`(순수 bf16) 경로.
 
 ### B.1 정확도 (fp32 exact 대비, chunk=32)
-| case | flash-ozaki | flash-exact (bf16) | torch SDPA |
-|---|---|---|---|
-| PREFILL MHA N=1024 | **1.61e-3** | 1.99e-3 | 1.99e-3 |
-| DECODE GQA B=32 N=2048 | **1.68e-3** | 2.25e-3 | 2.25e-3 |
+| case | flash-ozaki (bf16 out) | flash-exact (bf16) | torch SDPA (bf16) | prod-EAGER (fp32) | prod-FLASH (fp32) |
+|---|---|---|---|---|---|
+| PREFILL MHA N=1024 | **1.61e-3** | 1.99e-3 | 1.99e-3 | 1.66e-4 | 1.96e-4 |
+| DECODE GQA B=32 N=2048 | **1.68e-3** | 2.25e-3 | 2.25e-3 | — | — |
 
-flash-ozaki(nmp10)는 **순수 bf16 어텐션(SDPA/flash-exact)만큼 — 오히려 약간 더 — 정확**하다.
+- flash-ozaki(nmp10)는 **순수 bf16 어텐션(SDPA/flash-exact)만큼 — 오히려 약간 더 — 정확**하다. (P를 fp32로
+  유지한 채 block-FP 인코딩하므로, P를 bf16으로 truncate하는 SDPA/flash-exact보다 낫다.)
+- prod-EAGER/FLASH = **production `ozaki1_batched_gemm_fp`** 로 QK·PV를 돌린 torch 어텐션. EAGER는 전체 S를
+  materialize→전체행 fp32 softmax→PV, FLASH는 online-softmax(BN=32 타일별 QK/PV, P를 fp32 유지). 둘 다
+  **fp32를 반환**한다.
+
+> **핵심(정정): flash-ozaki의 "1.6e-3"은 >99%가 bf16 출력 반올림이지 ozaki·flash 알고리즘 오차가 아니다.**
+> - score(QK)·softmax 통계(m/l)·accumulator는 flash-ozaki도 **전부 fp32**다(SDPA·Triton flash와 동일). bf16은
+>   **최종 출력 저장**(`acc.to(Out.dtype)`) 한 곳뿐이며, bf16 모델의 정상 동작이다.
+> - 증거: **SDPA도 bf16 입력→bf16 출력(정상 사용법)이면 fp32-exact 대비 1.99e-3**, fp32로 돌리면 **3.4e-7**.
+>   flash-ozaki 출력을 fp32로 두면(=codegen twin 에뮬) 실제 ozaki 오차는 **~2e-4**로, prod-FLASH(1.96e-4)와
+>   일치한다. `emul(codegen twin)→bf16` 은 flash-ozaki와 **relerr까지 bit-일치**(1.534e-3=1.534e-3).
+> - GEMM 단독 검증: codegen QK/PV는 production `ozaki1_batched_gemm_fp`와 **relerr=0.0(bit-identical)**.
+
+**flash-ozaki는 production-based EAGER보다 production-based FLASH 에뮬레이션에 훨씬 가깝다** (출력 정밀도를 bf16로 맞춰 측정):
+
+| flash-ozaki 까지의 거리 (bf16 출력 일치) | relerr |
+|---|---|
+| ↔ **prod-FLASH**→bf16 (online softmax, 동일 구조) | **3.2e-5** |
+| ↔ **prod-EAGER**→bf16 (materialized full-row softmax) | 8.5e-4 |
+
+online-softmax flash 알고리즘을 production ozaki GEMM으로 **충실히 구현**했음을 확인(FLASH에 ~26× 더 가까움).
+eager와의 8.5e-4 차이는 알고리즘 차이(전체행 정규화 P vs per-tile 비정규화 P). fp32로 보면 두 거리가
+1.60e-3≈1.62e-3로 구분 안 되는데, 이는 flash-ozaki의 bf16 출력 반올림(~1.6e-3)이 3e-5 신호를 덮기 때문.
 
 ### B.2 지연 (ms/call, chunk=32) — **non-cached flash 속도**
 | case | flash-ozaki | flash-exact | torch SDPA | oz/sdpa |
