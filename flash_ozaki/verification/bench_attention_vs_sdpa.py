@@ -27,28 +27,26 @@ def _ozgemm_cfg(kdim, ndim, chunk):
                             rslt_type="ozaki1_fp")
 
 
-def prod_eager(q, k, v, nmp, w, chunk, p_bf16=True):
-    """EAGER production ozaki1_fp attention: materialize full S -> full-row fp32 softmax -> P@V, both
-    GEMMs via production ozaki1_batched_gemm_fp. p_bf16 truncates P to bf16 before P@V (default; matches
-    a real bf16 flash-attention datapath -- SDPA/flash-exact/flash-ozaki all do this). MHA/GQA, fp32 out."""
+def prod_eager(q, k, v, nmp, w, chunk):
+    """EAGER production ozaki1_fp attention: materialize full S -> full-row fp32 softmax -> P->bf16 -> P@V,
+    both GEMMs via production ozaki1_batched_gemm_fp. P is truncated to bf16 before P@V (the real bf16
+    flash-attention datapath -- SDPA/flash-exact/flash-ozaki all do this). MHA/GQA, fp32 out."""
     B, Hq, T, D = q.shape; Hkv, N = k.shape[1], k.shape[2]; G = Hq // Hkv; Z = B * Hq
     qf = q.reshape(Z, T, D); kf = repeat_kv(k, G).reshape(Z, N, D); vf = repeat_kv(v, G).reshape(Z, N, D)
     oz1 = Ozaki1Config(rounding="round_half_away_from_0", nmp=nmp, byte_split_style="all_signed_no_clamp")
     S = ozaki1_batched_gemm_fp(qf, kf.transpose(-1, -2), _ozgemm_cfg(D, N, chunk), oz1,
                                out_dtype=torch.float32, gemm_bits=w) / math.sqrt(D)
     qp = torch.arange(N - T, N, device=dev)[:, None]; kp = torch.arange(N, device=dev)[None, :]
-    P = torch.softmax(S.masked_fill(qp < kp, -float("inf")), -1)      # full-row fp32 softmax
-    if p_bf16:
-        P = P.to(torch.bfloat16)
+    P = torch.softmax(S.masked_fill(qp < kp, -float("inf")), -1).to(torch.bfloat16)   # full-row fp32 softmax, P->bf16
     O = ozaki1_batched_gemm_fp(P, vf, _ozgemm_cfg(N, D, chunk), oz1, out_dtype=torch.float32, gemm_bits=w)
     return O.reshape(B, Hq, T, D)
 
 
-def prod_flash(q, k, v, nmp, w, chunk, BN=32, p_bf16=True):
+def prod_flash(q, k, v, nmp, w, chunk, BN=32):
     """FLASH production ozaki1_fp attention: online-softmax over BN-wide kv tiles, per-tile QK and P@V
-    via production ozaki1_batched_gemm_fp. p_bf16 truncates P to bf16 for the P@V GEMM (default; the
-    fp32 l-normalizer is kept -- exactly what flash-ozaki/SDPA/flash-exact do). This mirrors flash-ozaki's
-    algorithm; only the GEMM impl differs (production vs codegen Triton). Returns fp32; MHA prefill."""
+    via production ozaki1_batched_gemm_fp. P is truncated to bf16 for the P@V GEMM while the fp32
+    l-normalizer is kept -- exactly what flash-ozaki/SDPA/flash-exact do. Mirrors flash-ozaki's algorithm;
+    only the GEMM impl differs (production vs codegen Triton). Returns fp32; MHA/GQA prefill."""
     B, Hq, T, D = q.shape; Hkv, N = k.shape[1], k.shape[2]; G = Hq // Hkv; Z = B * Hq
     qf = q.reshape(Z, T, D); kf = repeat_kv(k, G).reshape(Z, N, D); vf = repeat_kv(v, G).reshape(Z, N, D)
     oz1 = Ozaki1Config(rounding="round_half_away_from_0", nmp=nmp, byte_split_style="all_signed_no_clamp")
@@ -62,7 +60,7 @@ def prod_flash(q, k, v, nmp, w, chunk, BN=32, p_bf16=True):
         st = st.masked_fill(qpos < kp, -float("inf"))
         mn = torch.maximum(m, st.max(-1).values); al = torch.exp(m - mn); p = torch.exp(st - mn[:, :, None])
         l = l * al + p.sum(-1)                                   # fp32 normalizer (like flash-ozaki/SDPA)
-        pp = p.to(torch.bfloat16) if p_bf16 else p               # P->bf16 for P@V (real flash datapath)
+        pp = p.to(torch.bfloat16)                                # P->bf16 for P@V (real flash datapath)
         acc = acc * al[:, :, None] + ozaki1_batched_gemm_fp(pp, vt, _ozgemm_cfg(kt.shape[1], D, chunk),
                                                             oz1, out_dtype=torch.float32, gemm_bits=w)
         m = mn
@@ -72,27 +70,28 @@ def prod_flash(q, k, v, nmp, w, chunk, BN=32, p_bf16=True):
 D = 128; W, NMP = 4, 10; CHUNK = 32                          # ozaki config; CHUNK = block-FP reduction chunk
 _bf = lambda x: x.to(torch.bfloat16)
 print(f"=== Accuracy vs fp32-exact attention (ozaki w{W} nmp{NMP}, chunk={CHUNK}) ===")
-print(f"  {'case':>22} | {'flash-ozaki':>11} | {'flash-exact':>11} | {'SDPA':>9} | {'p-FLASH Pbf16':>13} | {'p-FLASH Pfp32':>13}")
+print(f"  {'case':>22} | {'flash-ozaki':>11} | {'flash-exact':>11} | {'SDPA':>9} | {'prod-FLASH':>11}")
 # prefill MHA
 B, H, N = 1, 28, 1024
 q = torch.randn(B, H, N, D, device=dev, dtype=torch.bfloat16); k = torch.randn(B, H, N, D, device=dev, dtype=torch.bfloat16); v = torch.randn(B, H, N, D, device=dev, dtype=torch.bfloat16)
 ex = exact_attn(q, k, v)
 oz = flash_oz1fp_cg(q, k, v, nmp=NMP, w=W, causal=True, chunk_size=CHUNK, BLOCK_M=32, BLOCK_N=32)   # bf16 out, P->bf16
 fe = flash_oz1fp_cg(q, k, v, nmp=1, w=8, causal=True, ozaki=False)
-pf_b = prod_flash(q, k, v, NMP, W, CHUNK, p_bf16=True)        # faithful: P->bf16 (like flash-ozaki)
-pf_f = prod_flash(q, k, v, NMP, W, CHUNK, p_bf16=False)       # reference: P kept fp32 (upper bound)
+pf = prod_flash(q, k, v, NMP, W, CHUNK)                      # production ozaki online-softmax flash (P->bf16)
+pe = prod_eager(q, k, v, NMP, W, CHUNK)                      # production ozaki materialized eager (P->bf16)
 print(f"  {'PREFILL MHA N=1024':>22} | {relerr(oz,ex):11.2e} | {relerr(fe,ex):11.2e} | {relerr(sdpa(q,k,v),ex):9.2e} | "
-      f"{relerr(pf_b,ex):13.2e} | {relerr(pf_f,ex):13.2e}")
+      f"{relerr(pf,ex):11.2e}")
 sdpa_fp32 = F.scaled_dot_product_attention(q.float(), k.float(), v.float(), is_causal=True)
 print(f"  * All bf16-flash-attention (SDPA / flash-exact / flash-ozaki) keep score(QK), softmax stats and the")
 print(f"    l-normalizer in fp32, but truncate P to bf16 for the P@V matmul (flash-exact: tl.dot(p.to(v.dtype),v);")
 print(f"    SDPA: FlashAttn tensor-core P@V; flash-ozaki: p.to(bf16) before block-FP PV). Only the final store is")
 print(f"    bf16 too. So flash-ozaki == SDPA/flash-exact accuracy ({relerr(oz,ex):.1e}); the ~2e-3 vs fp32-exact is the")
 print(f"    bf16 output+P rounding, NOT ozaki. Proof: SDPA is {relerr(sdpa(q,k,v),ex):.1e} at bf16 but {relerr(sdpa_fp32,ex):.1e} in fp32.")
-print(f"\n  -- flash-ozaki distance to production ozaki FLASH (output precision MATCHED to bf16) --")
-print(f"     flash-ozaki <-> prod-FLASH(P bf16)->bf16 : {relerr(oz, _bf(pf_b)):.2e}   (faithful: same P->bf16 flash datapath)")
-print(f"     flash-ozaki <-> prod-FLASH(P fp32)->bf16 : {relerr(oz, _bf(pf_f)):.2e}")
-print(f"     => flash-ozaki reproduces the production ozaki online-softmax FLASH with bf16 P to ~3e-5.")
+print(f"\n  -- flash-ozaki distance to production ozaki attention (output precision MATCHED to bf16) --")
+print(f"     flash-ozaki <-> prod-FLASH->bf16 (online softmax, same structure) : {relerr(oz, _bf(pf)):.2e}")
+print(f"     flash-ozaki <-> prod-EAGER->bf16 (materialized full-row softmax)  : {relerr(oz, _bf(pe)):.2e}")
+print(f"     => flash-ozaki is ~{relerr(oz,_bf(pe))/relerr(oz,_bf(pf)):.0f}x closer to the online-softmax FLASH emulation,")
+print(f"        reproducing the production ozaki flash (P->bf16 datapath) to ~3e-5.")
 
 print(f"\n=== Latency ms/call (ozaki chunk={CHUNK}); flash-ozaki at nmp10 AND nmp1 ===")
 print(f"  {'case':>26} | {'oz nmp10':>9} | {'oz nmp1(w8)':>11} | {'flash-exact':>11} | {'SDPA':>9} | {'nmp10/sdpa':>10}")

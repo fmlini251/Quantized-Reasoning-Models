@@ -149,10 +149,10 @@ slot-cuBLAS. flash_ozaki가 어텐션 전용인 이유.
 ozaki w4 nmp10, **chunk=32**. flash-exact = 같은 커널 `ozaki=False`(순수 bf16) 경로.
 
 ### B.1 정확도 (fp32 exact 대비, chunk=32)
-| case | flash-ozaki (bf16) | flash-exact (bf16) | torch SDPA (bf16) | prod-FLASH P-bf16 (fp32 out) | prod-FLASH P-fp32 (fp32 out) |
-|---|---|---|---|---|---|
-| PREFILL MHA N=1024 | **1.99e-3** | 1.99e-3 | 1.99e-3 | 1.19e-3 | 1.96e-4 |
-| DECODE GQA B=32 N=2048 | **2.28e-3** | 2.26e-3 | 2.25e-3 | — | — |
+| case | flash-ozaki (bf16) | flash-exact (bf16) | torch SDPA (bf16) | prod-FLASH (P→bf16, fp32 out) |
+|---|---|---|---|---|
+| PREFILL MHA N=1024 | **1.99e-3** | 1.99e-3 | 1.99e-3 | 1.19e-3 |
+| DECODE GQA B=32 N=2048 | **2.28e-3** | 2.26e-3 | 2.25e-3 | — |
 
 - flash-ozaki(nmp10)는 **순수 bf16 어텐션(SDPA/flash-exact)과 정확도 동일**하다. ozaki 양자화가 추가하는
   오차는 무시할 수준(bf16 아래).
@@ -167,8 +167,8 @@ ozaki w4 nmp10, **chunk=32**. flash-exact = 같은 커널 `ozaki=False`(순수 b
 
 > **핵심: flash-ozaki의 "2e-3 (vs fp32-exact)"는 ozaki·flash 알고리즘 오차가 아니라 bf16(출력 + P) 반올림이다.**
 > - 증거: **SDPA도 bf16 입력→bf16 출력(정상 사용법)이면 1.99e-3**, fp32로 돌리면 **3.4e-7**. 같은 알고리즘,
->   출력 dtype만 다르다. prod-FLASH(P fp32, fp32 out)의 실제 ozaki 오차는 **~2e-4**, P를 bf16으로 truncate하면
->   (fp32 out) 1.19e-3, 여기에 bf16 출력까지 더하면 flash-ozaki의 1.99e-3이 된다.
+>   출력 dtype만 다르다. prod-FLASH(P→bf16, fp32 출력) = 1.19e-3에 bf16 출력 반올림까지 더하면 flash-ozaki의
+>   1.99e-3이 되며, ozaki 양자화 자체 기여분은 그 아래로 무시할 수준이다.
 > - GEMM 단독 검증: codegen QK/PV는 production `ozaki1_batched_gemm_fp`와 **relerr=0.0(bit-identical)**.
 
 **flash-ozaki는 production-based EAGER보다 production-based FLASH 에뮬레이션에 훨씬 가깝다** (출력·P 정밀도를 동일하게 bf16으로 맞춰 측정):
