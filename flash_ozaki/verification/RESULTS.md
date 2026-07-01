@@ -90,11 +90,17 @@ cuBLAS bf16 GEMM(ozaki 없음) = 0.177 ms.
   cuBLAS 호출 대비 작은 비중이라 캐시 이득이 작다. (production의 "큰 cache 이득"은 **모델-레벨 weight_cache** —
   weight를 전체 추론에서 **한 번만** 인코딩해 모든 토큰/레이어에 재사용 — 로, 여기 단일-GEMM 벤치와는 amortize
   범위가 다르다.)
-- **w8 nmp1은 손익분기**: mine c(0.314) vs prod c(0.247)=1.27× mine이 느림. 둘 다 **bf16 ozaki1_fp**이므로
-  int8-vs-bf16 차이가 아니다. `#GEMM`=1이라 fused의 이점(피연산자 1회 로드를 여러 자릿수 dot에 재사용, production의
-  `#GEMM`개 개별 cuBLAS+combine 제거)이 없어, production의 encode(1회)+cuBLAS가 단일 GEMM에선 더 효율적.
-- **nmp≥9에서 역전**: mine c가 prod c의 0.29~0.45×(2~3.4× 빠름). non-cached는 더 극적 — mine nc(0.85)가
-  prod nc(2.39)의 ~1/3(production은 매 호출 재인코딩 + `#GEMM`개 cuBLAS).
+- **w8 nmp1은 손익분기 (mine 1.27× 느림) — 원인은 activation A의 N-타일 중복 인코딩** (둘 다 bf16 ozaki1_fp,
+  int8 무관). 마이크로벤치로 격리(타일 고정 BM=BN=64, grid의 n-타일 수만 변경):
+  cuBLAS 0.175 / mine 0.314(오버헤드 **+0.139**). A block-FP 인코딩을 **GEMM처럼 16 n-타일**로 돌리면 **0.130ms**
+  (오버헤드 거의 전부), **1회만**이면 0.022ms → fused는 A[m-타일]을 **n-타일마다(=`#GEMM`이 아니라 N/BN=16번)
+  재인코딩**해 ~5.8× 부풀린다(448 프로그램에선 A6000 미포화라 16×가 아닌 5.8× wall). dot 자체는 문제 없음
+  (순수 Triton GEMM 0.138 ≤ cuBLAS 0.175). production은 A를 **1회**만(별도 패스) 인코딩 후 cuBLAS → `#GEMM`=1
+  에선 이 중복 인코딩이 GEMM 전체 비용에 맞먹어 mine이 짐. (앞서 BN 스윕으로 "중복 아님"이라 했던 것은 BN이
+  타일크기와 n-타일수를 동시에 바꿔 SRAM 페널티가 가린 것 — 타일 고정 격리로 중복이 지배적임이 확정됨.)
+- **nmp≥9에서 역전**: 같은 0.13ms 인코딩이 타일당 9~16개 자릿수 dot에 분산되고, production은 `#GEMM`개 개별
+  cuBLAS(2~3ms)를 내야 하므로 mine c가 prod c의 0.29~0.45×(2~3.4× 빠름). non-cached는 더 극적 — mine nc(0.85)가
+  prod nc(2.39)의 ~1/3.
 
 ---
 
