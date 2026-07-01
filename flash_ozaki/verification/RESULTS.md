@@ -132,6 +132,26 @@ flash-ozaki(nmp10)는 **순수 bf16 어텐션(SDPA/flash-exact)만큼 — 오히
 - **Decode**: flash-ozaki가 **torch SDPA보다 빠르다**(B=32에서 ~3.2×). GQA 헤드 폴딩으로 7개 쿼리 헤드를
   하나의 `[G,D]` 타일로 묶어 q_len=1 GQA를 SDPA보다 잘 처리. exact bf16 대비는 ~5×(ozaki 비용).
 
+### B.3 prefill이 flash-exact보다 ~8× (SDPA 대비 ~13×) 느린 원인 분해 (N=2048, 측정)
+| config | ms | /exact |
+|---|---|---|
+| flash-exact (ozaki off, bf16 1 dot) | 0.651 | 1× |
+| nmp1 w8 (자릿수 dot **1개** + 인코딩) | 2.391 | **3.7×** |
+| nmp4 w4 (pack=1 dot, nD2) | 3.116 | 4.8× |
+| nmp9 w4 (pack=4 dots, nD3) | 3.997 | 6.1× |
+| nmp10 chunk=None (QK 1청크) | 63.49 | **97.6×** (OOM 재시도) |
+| nmp10 chunk=32 (pack=5 dots) | 5.197 | **8.0×** |
+
+1. **블록-FP 인코딩이 지배(~2.7×)**: nmp1은 자릿수 dot이 exact와 같은 1개인데도 3.7× → 느린 건 dot이 아니라
+   Q/K/P/V 4개 피연산자의 타일별 인코딩(amax 리덕션 + `a/scale` fp32 나눗셈 + round/clamp + int→bf16 캐스트).
+   flash-exact는 raw bf16이라 인코딩 0.
+2. **다중 자릿수 dot(+~2×)**: pack-plan dot 수 1→4→5 (nmp1/9/10)에 비례해 3.7×→6.1×→8.0×.
+3. **chunk=32가 Q/K를 head_dim 청크별로 재인코딩**해 인코딩 증폭. 단 chunk=None은 nD≥4에서 OOM 재시도로
+   **97.6×**(Part C) — chunk=32가 정답.
+
+본질적으로 int8 ozaki 수치를 SW로 재현하는 비용(HW int8 데이터패스 대체). 개선 레버: `a/scale`(2^k)을 역수
+곱/지수 시프트로, 인코딩 중복 축소.
+
 ---
 
 ## Part C — chunk=32를 표준으로 쓴 근거
