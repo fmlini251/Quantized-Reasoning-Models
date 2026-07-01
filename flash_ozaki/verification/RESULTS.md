@@ -243,9 +243,20 @@ production(`ozaki1_fp_speed.md`)은 **decode 캐시 이득이 큼**(w4 nmp10 dec
 - **append 자체(1.5~4.3ms)가 naive step(0.38~1.5ms)보다 크다** → 증분이 net 손해. 분해하면 torch `encode_kv`
   (32토큰)=~1.5ms(토큰 수 무관, frexp/파이썬 루프/pack-커널 launch 오버헤드) + O(N) concat(캐시 전체 복사).
 - **병목은 "증분 vs 전체"가 아니라 인코더가 torch 참조 구현**이라는 점 — naive는 전체 K/V 인코딩을 **fused
-  triton 커널 안에서**(수십 µs) 하므로 오히려 빠르다. production의 decode 대박 이득은 fused CUDA 인코더
-  (`oz1_wbit_super_encode`) 덕. → 재현하려면 **fused CUDA/triton 증분 인코더 + 사전할당 캐시(concat 제거)** 필요
-  (후속 최적화). 현 단계 결론: attention 쪽 캐시 이득은 ~1.3×로 확정, 그 이상은 인코더를 fused로 만들어야 열린다.
+  triton 커널 안에서**(수십 µs) 하므로 오히려 빠르다.
+
+**fused-triton 증분 인코더 (`encode_kv_append_fused`, in-place, 옵션 구현):** torch append(≈2187µs)를 2개
+fused triton 커널(`_enc_k_kernel`/`_enc_v_kernel`)이 사전할당 캐시에 **in-place 기록**(concat 제거)하는 것으로
+대체. 결과(N=2048, B=32 GQA decode, w4 nmp9): **append 2187µs → 91µs (24× 빠름)**, bit-identical. 이제 증분
+per-step(append 91 + cached-attn 590 = 682µs)이 naive(757µs)를 **1.11× 이긴다**(torch일 땐 졌음).
+
+- 그래도 이득은 작다(상한 ~1.3×): cached-attention(590µs)이 지배, naive 재인코딩도 fused라 싸고(전체 N ≈167µs),
+  fused append도 2-커널 launch 오버헤드(~91µs, 32토큰엔 과함). 짧은 컨텍스트(<~1100토큰)에선 append(91µs) >
+  naive 재인코딩이라 오히려 손해, 긴 컨텍스트에서만 이득.
+- **production식 3.5×가 안 나오는 근본 이유**: production은 **거대 정적 weight(4096²)**를 매 M=1 GEMV마다
+  재인코딩→인코딩 ≫ GEMV. 우리 attention의 K/V 인코딩은 attention 대비 작고 naive조차 fused라 절약분이 적다.
+  → 더 밀어붙이려면 **새 토큰 인코딩을 decode attention 커널에 융합**(별도 launch 제거)해야 함(production이 그렇게 함).
+  현 결론: attention 쪽 캐시 이득 상한 ~1.3×; fused 증분 인코더로 그 상한을 실제로 달성(net 1.11×).
 
 ### E.3 cached vs non-cached = ~1e-5는 **순수 fp 누산 순서**(값 차이 아님) 확인
 - 인코딩은 비트동일 — GEMM에서 `cached==fresh`가 w4 nmp10 chunk=32에서 `0.00e+00`; non-cached 커널에 raw K를
