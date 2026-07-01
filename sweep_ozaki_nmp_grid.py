@@ -54,9 +54,10 @@ import sys
 import glob
 import json
 import time
-import hashlib
 import argparse
 import subprocess
+
+from run_naming import make_run_tag  # shared with inference_vllm.py; single source of truth
 
 # --- base config (mirrors configs/ozaki1_fp_per_op_gsm8k.yaml, dataset swapped to MATH-500) ---
 MODEL = "./modelzoo/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B"
@@ -78,9 +79,12 @@ OUT_DIR = "outputs/sweep_nmp_grid"
 LOG_DIR = "logs/sweep_nmp_grid"
 INFERENCE_DIR = "outputs/inference"   # where inference_vllm.py writes its canonical hash dirs
 
-# Known-good reference hashes (config -> dir suffix) used as a startup self-check: if the
-# canonical hashing below ever drifts from inference_vllm.py::_make_run_tag, this trips loudly
-# instead of silently recomputing every cached cell. {hash: (placement, base_nmp, overrides)}
+# Known-good reference hashes (config -> dir suffix) used as a startup self-check. The hash
+# ALGORITHM is now imported from inference_vllm.py (run_naming.make_run_tag) so it cannot silently
+# drift; what this guards is canonical_args below (a stray/removed hashed field). These four are
+# LEGACY dirs — written by the older inference_vllm.py that carried a `--methods` arg, which left a
+# `methods=None` entry in the hashed config — so self_check() reproduces them via the same legacy
+# shim result_jsonl() uses to reuse them. {hash: (placement, base_nmp, overrides)}
 _SELFCHECK = {
     "f2eb474f": ("linear_only", 1, None),                                  # (L=1, A=BF16)=0.912
     "e5b4c52c": ("linear_only", 3, None),                                  # (L=3, A=BF16)=0.936
@@ -109,10 +113,13 @@ def cell_to_run(L, A):
 
 
 def canonical_args(spec):
-    """Full args dict (every inference_vllm.py argparse field) for a run spec, so we can compute
-    the SAME output-dir hash inference_vllm.py would and reuse any existing matching run.
-    Mirrors inference_vllm.py defaults; verified bit-exact against existing runs (see _SELFCHECK).
-    Only the non-excluded keys actually affect the hash, but we fill the full set to be safe."""
+    """Full args dict (every current inference_vllm.py argparse field) for a run spec, so
+    make_run_tag() computes the SAME output-dir hash a freshly-launched inference_vllm.py run
+    would, and a just-finished run is picked up instead of re-launched. Mirrors inference_vllm.py
+    defaults; the hashed keys must stay in lock-step with its argparse (self_check guards this).
+    NOTE: no `methods` key — current inference_vllm.py has no `--methods` arg, so adding one here
+    would compute a hash no fresh run ever writes (that was the silent-loss bug). Legacy dirs that
+    DO carry methods=None are reached via result_jsonl()'s legacy shim, not from here."""
     placement = spec["placement"]
     a = {
         # --- excluded from the hash (perf / run-control / derived) but kept for completeness ---
@@ -123,7 +130,7 @@ def canonical_args(spec):
         # --- part of the hash ---
         "model": MODEL, "dtype": "bfloat16", "seed": 42,
         "temperature": 0.6, "top_p": 0.95, "max_new_tokens": 32768, "max_model_length": 32768,
-        "max_samples": None, "methods": None, "load_responses_from_json_file": None,
+        "max_samples": None, "load_responses_from_json_file": None,
         "ozaki_arch": "Qwen2OzakiForCausalLM",
         "ozaki_placement": (None if placement == "off" else placement),
         "rslt_type": RSLT_TYPE, "k": K, "weight_cache": WEIGHT_CACHE,
@@ -137,52 +144,37 @@ def canonical_args(spec):
     return a
 
 
-def run_tag(a):
-    """Replicates inference_vllm.py::_make_run_tag exactly (legible parts + 8-char md5)."""
-    if a["ozaki_placement"] is None:
-        keys = ["model", "dtype", "seed"]
-    elif a["rslt_type"] in ("ozaki1", "ozaki1_fp"):
-        keys = ["model", "ozaki_placement", "rslt_type", "nmp", "k", "weight_cache", "dtype", "seed"]
-    else:
-        keys = ["model", "ozaki_placement", "rslt_type", "s", "k", "scale_method",
-                "shift_bits", "M_frac_bits", "weight_cache", "combine_fp64", "dtype", "seed"]
-    parts = []
-    for k in keys:
-        v = a[k]
-        if isinstance(v, bool):
-            v = int(v)
-        elif "/" in str(v):
-            v = str(v).rstrip("/").split("/")[-1]
-        parts.append(f"{k}={v}")
-    exclude = {"config", "output_dir", "output_path", "model_name", "tensor_parallel_size",
-               "overwrite", "debug", "dataset", "gpu_memory_utilization",
-               "max_num_batched_tokens", "max_num_seqs"}
-    ozaki1_only = {"nmp", "nmp_overrides", "gemm_bits", "byte_split_style"}
-    ozaki2_only = {"s", "scale_method", "shift_bits", "M_frac_bits", "combine_fp64", "s_overrides"}
-    if a["ozaki_placement"] is None:
-        exclude |= {"ozaki_placement", "rslt_type", "k", "weight_cache", "ozaki_arch"} | ozaki1_only | ozaki2_only
-    elif a["rslt_type"] in ("ozaki1", "ozaki1_fp"):
-        exclude |= ozaki2_only
-    else:
-        exclude |= ozaki1_only
-    cfg = {k: v for k, v in a.items() if k not in exclude}
-    h = hashlib.md5(json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest()[:8]
-    return "__".join(parts) + f"__{h}"
-
-
 def canonical_jsonl(spec):
-    """The exact path current inference_vllm.py writes for this spec."""
-    return os.path.join(INFERENCE_DIR, run_tag(canonical_args(spec)), f"{DATASET}.jsonl")
+    """The exact path CURRENT inference_vllm.py writes for this spec (shared make_run_tag), i.e.
+    where a freshly-launched run will land and where a just-finished run must be looked up."""
+    return os.path.join(INFERENCE_DIR, make_run_tag(canonical_args(spec)), f"{DATASET}.jsonl")
+
+
+def legacy_jsonl(spec):
+    """Path from the OLDER inference_vllm.py that still had a `--methods` arg: it left a
+    `methods=None` entry in the hashed config, so its dirs differ from today's. Every result
+    currently on disk was written that way, so we resolve it here to reuse completed cells
+    instead of relaunching multi-hour runs."""
+    a = dict(canonical_args(spec))
+    a["methods"] = None
+    return os.path.join(INFERENCE_DIR, make_run_tag(a), f"{DATASET}.jsonl")
 
 
 def result_jsonl(spec):
     """Best existing result path for a spec, else the canonical path (where a fresh run lands).
-    The native bf16 baseline (BF16,BF16) predates inference_vllm.py's `methods` arg, so its dir
-    hash differs from today's; for `off` we fall back to any matching native-baseline dir so the
-    known 0.948 is reused instead of recomputed."""
+    Preference order:
+      1. canonical (current-code) hash -- where a freshly-launched run WILL land, so a run that
+         just finished is picked up here (the phantom-`methods` key used to miss this entirely,
+         silently losing the accuracy of every newly-run cell);
+      2. legacy (with-`methods`) hash  -- every result already on disk, reused not recomputed;
+      3. for the native bf16 baseline (`off`, which predates both schemes) any matching native
+         dir, so the known 0.948 is reused instead of recomputed."""
     primary = canonical_jsonl(spec)
     if os.path.exists(primary):
         return primary
+    legacy = legacy_jsonl(spec)
+    if os.path.exists(legacy):
+        return legacy
     if spec["placement"] == "off":
         name = MODEL.rstrip("/").split("/")[-1]
         pat = os.path.join(INFERENCE_DIR, f"model={name}__dtype=bfloat16__seed=42__*", f"{DATASET}.jsonl")
@@ -226,15 +218,21 @@ def build_cmd(spec):
 
 
 def self_check():
-    """Fail loudly if our canonical hashing has drifted from inference_vllm.py."""
+    """Fail loudly if canonical_args has drifted. The hash algorithm is imported from
+    inference_vllm.py (run_naming.make_run_tag) so it can't silently diverge; the remaining risk
+    is canonical_args gaining/losing a hashed field. The four references are LEGACY dirs, so we
+    reproduce them through the same `methods=None` shim legacy_jsonl() uses -- if canonical_args
+    changes shape this trips, instead of silently missing every cached cell."""
     bad = []
     for want, (placement, nmp, ov) in _SELFCHECK.items():
         spec = dict(placement=placement, nmp=nmp, overrides=ov)
-        got = run_tag(canonical_args(spec)).split("__")[-1]
+        a = dict(canonical_args(spec))
+        a["methods"] = None
+        got = make_run_tag(a).split("__")[-1]
         if got != want:
             bad.append(f"  {placement} nmp={nmp} ov={ov}: expected {want}, got {got}")
     if bad:
-        raise SystemExit("Canonical-hash self-check FAILED (inference_vllm.py changed?):\n"
+        raise SystemExit("Canonical-hash self-check FAILED (canonical_args changed?):\n"
                          + "\n".join(bad))
 
 

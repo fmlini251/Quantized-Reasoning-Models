@@ -1,9 +1,10 @@
 import os
 import json
 import random
-import hashlib
 import argparse
 from tqdm import tqdm
+
+from run_naming import make_run_tag as _make_run_tag  # single source of truth for run-dir hashing
 
 import torch
 import transformers
@@ -15,48 +16,6 @@ from lighteval_custom.models.vllm.vllm_model import VLLMModelConfig
 from lighteval_custom.main_vllm import vllm
 from vllm_custom.model_executor.fake_quantized_models.registry import register_fake_quantized_models
 register_fake_quantized_models()    # register fake-quantized models in vLLM
-
-
-def _make_run_tag(args):
-    """Output-dir name for a run: legible ``key=value`` parts + an 8-char md5 of the full
-    config. Mirrors emulation/llm/utils.py::make_result_filename so runs are self-describing
-    and any two distinct configs land in distinct dirs. The dataset is the file name
-    (<dataset>.jsonl) INSIDE the dir, not part of the tag, so one config dir collects every
-    dataset run with that config. Perf-only knobs (gpu mem util, batch caps) and run-control
-    flags are excluded from the hash since they don't change the results.
-    """
-    if args.ozaki_placement is None:
-        keys = ["model", "dtype", "seed"]
-    elif args.rslt_type in ("ozaki1", "ozaki1_fp"):
-        keys = ["model", "ozaki_placement", "rslt_type", "nmp", "k", "weight_cache", "dtype", "seed"]
-    else:
-        keys = ["model", "ozaki_placement", "rslt_type", "s", "k", "scale_method",
-                "shift_bits", "M_frac_bits", "weight_cache", "combine_fp64", "dtype", "seed"]
-    parts = []
-    for k in keys:
-        v = getattr(args, k)
-        if isinstance(v, bool):
-            v = int(v)
-        elif "/" in str(v):
-            v = str(v).rstrip("/").split("/")[-1]
-        parts.append(f"{k}={v}")
-    # Hash the config that actually affects THIS run. Always drop run-control / derived / perf
-    # fields; additionally drop Ozaki params that don't apply (all of them when ozaki is off,
-    # the other scheme's params when on) so numerically-identical runs share one dir.
-    exclude = {"config", "output_dir", "output_path", "model_name", "tensor_parallel_size",
-               "overwrite", "debug", "dataset", "gpu_memory_utilization",
-               "max_num_batched_tokens", "max_num_seqs"}
-    ozaki1_only = {"nmp", "nmp_overrides", "gemm_bits", "byte_split_style"}
-    ozaki2_only = {"s", "scale_method", "shift_bits", "M_frac_bits", "combine_fp64", "s_overrides"}
-    if args.ozaki_placement is None:
-        exclude |= {"ozaki_placement", "rslt_type", "k", "weight_cache", "ozaki_arch"} | ozaki1_only | ozaki2_only
-    elif args.rslt_type in ("ozaki1", "ozaki1_fp"):
-        exclude |= ozaki2_only
-    else:
-        exclude |= ozaki1_only
-    cfg = {k: v for k, v in vars(args).items() if k not in exclude}
-    h = hashlib.md5(json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest()[:8]
-    return "__".join(parts) + f"__{h}"
 
 
 def parser_gen():
