@@ -227,8 +227,25 @@ production(`ozaki1_fp_speed.md`)은 **decode 캐시 이득이 큼**(w4 nmp10 dec
   non-cached decode는 매 M=1 GEMV(50µs)마다 거대한 weight(4096²)를 재인코딩→인코딩≫GEMV→decode 이득 큼.
 - 우리 attention KV 캐시는 **동적**(decode마다 새 토큰 K/V가 append)이고, 인코딩이 커널에 **융합돼 저렴**(호출당
   ~22–28%). 그래서 전체 재인코딩을 캐시로 없애도 ~1.3×.
-- production식 decode 대박 이득을 보려면 **증분 인코딩**(새 토큰 K/V만 O(D) 인코딩해 캐시에 append, 과거 재사용)이
+- production식 decode 대박 이득을 보려면 **증분 인코딩**(새 토큰 K/V만 인코딩해 캐시에 append, 과거 재사용)이
   필요 — 현 bench는 매 호출 전체 N개를 재인코딩하므로 그 이득을 측정하지 않는다(실서빙 KV-cache는 증분).
+
+**증분 인코딩 실측 (`encode_kv_append`, 새 32-토큰 블록만 인코딩해 append):** 정확성은 완벽(append 캐시 ==
+전체 encode 캐시, **bit-identical**, attn relerr 0.0). 그러나 **지금 구현으론 오히려 손해**다:
+
+| N | naive per-step(전체 재인코딩+attn) | cached(사전인코딩) | naive/cached | append 1블록(torch enc + O(N) concat) |
+|---|---|---|---|---|
+| 1024 | 0.380 | 0.296 | 1.28× | ~2.7ms (enc 1.95 + concat 0.71) |
+| 2048 | 0.753 | 0.586 | 1.29× | ~2.9ms (enc 1.46 + concat 1.41) |
+| 4096 | 1.499 | 1.161 | 1.29× | ~4.3ms (enc 1.46 + concat 2.87) |
+
+- per-step 이득은 컨텍스트 길이 무관하게 **flat ~1.3×** (production의 "N이 클수록 커지는 decode 이득"과 다름).
+- **append 자체(1.5~4.3ms)가 naive step(0.38~1.5ms)보다 크다** → 증분이 net 손해. 분해하면 torch `encode_kv`
+  (32토큰)=~1.5ms(토큰 수 무관, frexp/파이썬 루프/pack-커널 launch 오버헤드) + O(N) concat(캐시 전체 복사).
+- **병목은 "증분 vs 전체"가 아니라 인코더가 torch 참조 구현**이라는 점 — naive는 전체 K/V 인코딩을 **fused
+  triton 커널 안에서**(수십 µs) 하므로 오히려 빠르다. production의 decode 대박 이득은 fused CUDA 인코더
+  (`oz1_wbit_super_encode`) 덕. → 재현하려면 **fused CUDA/triton 증분 인코더 + 사전할당 캐시(concat 제거)** 필요
+  (후속 최적화). 현 단계 결론: attention 쪽 캐시 이득은 ~1.3×로 확정, 그 이상은 인코더를 fused로 만들어야 열린다.
 
 ### E.3 cached vs non-cached = ~1e-5는 **순수 fp 누산 순서**(값 차이 아님) 확인
 - 인코딩은 비트동일 — GEMM에서 `cached==fresh`가 w4 nmp10 chunk=32에서 `0.00e+00`; non-cached 커널에 raw K를
