@@ -340,6 +340,36 @@ ozaki 없는 순수 bf16 Triton GEMM을 타일링별로 cuBLAS `torch.bmm`과 �
 즉 **fused(mine)는 HBM 왕복·launch를 없애 저강도/decode에서 이기고, slot-cuBLAS(prod)는 big-tile near-peak로
 compute-bound linear prefill에서 이긴다.** (같은 이유로 flash_ozaki 어텐션 백엔드는 fused, linear는 production을 쓴다.)
 
+### D.2 mine이 큰 타일을 못 쓰는 원인 — 레지스터 벽 (측정: `tile_wall.py`, w4 nmp10 nD4 #G5)
+mine의 program당 **상주 레지스터 상태**가 plain GEMM보다 근본적으로 무겁다:
+- **[BM,BN] fp32 accumulator 2개**: `acc`(청크 누적 총합) + `cacc`(청크 내 #G dot을 block-FP 스케일 전에 모으는
+  버퍼). plain GEMM은 1개.
+- **operand당 nD개 자릿수 평면 상주**: `ap[0..nD-1]`([BM,CHUNK]), `bp[0..nD-1]`([CHUNK,BN]). plain은 1쌍.
+- **#G개 dot의 super-digit 중간값**(각 dot이 `super(ap[i0:i1])`=평면 합을 만들어 tl.dot).
+
+**측정된 레지스터/스레드 (64×64 / nw4, 0 spill):** #G/nD에 비례해 증가 →
+`nD1 #G1: 128r · nD2 #G1: 128r · nD3 #G4: 207r · nD4 #G5: 226r · nD5 #G6: 223r`.
+즉 정확도 sweet-spot(nmp9/10/15, #G4~6)은 이미 **255 상한 근처(207~226r)**.
+
+**128×128로 키우면** accumulator만 acc+cacc `2×[128,128]fp32` = nw8에서도 128 r/thread → 평면·중간값 얹으면:
+| tile/nw | regs | spill | shmem | time | 결과 |
+|---|---|---|---|---|---|
+| 64×64 / nw4  | 226 | 0   | 32KB | **52.4ms** | 유일한 무-spill big-ish, 최적 |
+| 128×64 / nw4 | 255 | 14  | 52KB | 60.9ms | 상한 도달→spill |
+| 128×128 / nw4| 255 | **250** | 64KB | **178ms** | 대량 spill (3.4× 악화) |
+| 128×128 / nw8| 255 | 26  | 84KB | 53.3ms | 여전히 spill, 이득 없음 |
+| 256×128 / nw8| — | — | 131KB | **OOM** | 공유메모리 초과(>101KB) |
+
+**대조:** #G=1 config(nmp1 w8 / nmp4·16 w4, 평면 1쌍·dot 1개)는 128×128이 **220r·0 spill로 들어간다** → 큰 타일
+가능. plain bf16 Triton도 128×128 = cuBLAS의 0.96×(Part D). 즉 **큰 타일을 막는 건 GEMM 구조가 아니라 ozaki
+자릿수-평면 상태(2 accumulator + nD 평면 + #G dot)** — nmp10/15는 그 상태 때문에 64×64에 고정되고, 64×64 MMA는
+compute-bound GEMM에서 cuBLAS의 256×128(32×3 파이프) 대비 효율이 낮아 12.8× cuBLAS / 1.8× prod가 된다.
+
+**함의:** ① 저강도 어텐션·decode는 GEMM이 병목이 아니라(메모리/launch) 64×64로도 충분 → mine의 fusion이 이김.
+② compute-bound linear만 big-tile 효율이 지배 → 레지스터 벽 때문에 mine이 짐. (cacc를 없애고 per-dot 스케일로
+acc에 직접 누적하면 accumulator 1개로 ~64r 절약해 128×64 정도는 가능하나, nD 평면·#G dot 압력은 남고 prod의
+cuBLAS가 이미 효율 상한이라 compute-bound에서 mine이 prod를 이기진 못함 → 벽은 fused 자릿수-평면 방식의 구조적 성질.)
+
 ---
 
 ## Part E — 사전 인코딩 KV 캐시 (`flash_oz1fp_cg_cached`, `flash_ozaki/bench_cached.py`, chunk=32)
