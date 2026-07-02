@@ -16,10 +16,12 @@ Selection (no model files edited on disk) -- set the HF config architectures and
 `inference_vllm.py --ozaki_placement linear_only ...` (or `full` for the full variant) wires this
 up automatically.
 
-Known divergence from the transformers --linear_only path: `lm_head` (a vLLM
-ParallelLMHead, not a LinearBase) stays native here; the transformers path also
-Ozaki-fies lm_head. lm_head runs once per generated token (not per layer) so the impact
-is small, but it must be accounted for when validating numerical equivalence.
+`lm_head` is ALSO routed through ozaki here (it is a vLLM ParallelLMHead, not a LinearBase, so
+the LinearBase loop skips it -- but its logits GEMM goes through `lm_head.linear_method.apply`,
+which we swap to the same OzakiLinearMethod; weight is (vocab, hidden) = (out, in)). This matches
+the transformers --linear_only path (which also Ozaki-fies lm_head) and applies for both
+linear_only and full (the only placements that use this class). Skipped only when word embeddings
+are tied (would corrupt the shared embed_tokens weight via the cache path).
 """
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -96,11 +98,31 @@ class Qwen2OzakiForCausalLM(Qwen2ForCausalLM):
                 module._ozaki_name = _name
                 n_routed += 1
 
+        # lm_head: a ParallelLMHead (VocabParallelEmbedding), NOT a LinearBase, so the loop above
+        # skips it. But it IS a linear op -- the LogitsProcessor computes logits via
+        # `lm_head.linear_method.apply(lm_head, hidden)` and its weight is (vocab, hidden) = (out, in),
+        # the same convention as a linear layer -- so the shared OzakiLinearMethod routes it correctly.
+        # Ozaki-fy it too (this class is only instantiated for linear_only / full; attn_only + off use
+        # stock Qwen2), matching the transformers --linear_only path which also emulates lm_head.
+        # SKIP when weights are tied (lm_head.weight IS embed_tokens.weight): the weight_cache path
+        # frees the bf16 weight to CPU after encoding, which would break the shared input embedding.
+        lm_head = getattr(self, "lm_head", None)
+        embed = getattr(getattr(self, "model", None), "embed_tokens", None)
+        tied = (lm_head is not None and embed is not None
+                and getattr(lm_head, "weight", None) is getattr(embed, "weight", object()))
+        routed_lm_head = lm_head is not None and not tied
+        if routed_lm_head:
+            lm_head.linear_method = method       # LogitsProcessor calls lm_head.linear_method.apply()
+            lm_head._ozaki_wc = None
+            lm_head._ozaki_name = "lm_head"       # base nmp (no linear-name override matches "lm_head")
+
         scheme_param = f"s={s}" if rslt_type in ("ozaki2", "ozaki", "ozaki2_fp") else f"nmp={nmp}"
         ov = s_overrides if rslt_type in ("ozaki2", "ozaki", "ozaki2_fp") else nmp_overrides
         ov_str = f", per-op overrides={ov}" if ov else ""
         w_str = f", w={gemm_bits}" if gemm_bits != 8 else ""
+        lm_str = "lm_head ALSO ozaki" if routed_lm_head else ("lm_head native (tied weights)" if tied
+                                                              else "lm_head native")
         logger.info(
-            "[Ozaki] linear-only: routed %d linear layers through ozaki "
-            "(rslt_type=%s, %s%s, chunk_size=%d, weight_cache=%s%s); attention + lm_head stay native.",
-            n_routed, rslt_type, scheme_param, w_str, chunk_size, use_weight_cache, ov_str)
+            "[Ozaki] linear-only: routed %d linear layers + %s through ozaki "
+            "(rslt_type=%s, %s%s, chunk_size=%d, weight_cache=%s%s); attention stays native.",
+            n_routed, lm_str, rslt_type, scheme_param, w_str, chunk_size, use_weight_cache, ov_str)
