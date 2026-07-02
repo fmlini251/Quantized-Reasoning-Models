@@ -829,3 +829,211 @@ def flash_oz1fp_cg_cached(q, kv, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm
     if G == 1:
         return o.reshape(B, Hq, T, D)
     return o.reshape(B, Hkv, T, G, D).permute(0, 1, 3, 2, 4).reshape(B, Hq, T, D)
+
+
+# --- split-KV / flash-decoding (opt-in, decode) -----------------------------------------------
+# ncu shows ozaki DECODE is integer-ALU-bound (~44%) at only ~13% occupancy with DRAM ~30% idle
+# (exact decode is DRAM-bound at ~96%): the grid B*Hkv is too small to fill the SMs, so the ALU
+# emulation can't hide behind the KV-read memory traffic. Split the kv loop into N_SPLITS program-z
+# slices (grid gains an S axis), each computing a PARTIAL online-softmax (m,l,acc); a combine kernel
+# merges them by log-sum-exp. More concurrent programs -> higher occupancy -> the ALU overlaps the
+# idle memory pipe. chunk=32 only; each split is a whole number of BLOCK_N tiles so per-tile block-FP
+# is byte-for-byte the non-split encoding (result matches non-split to fp-accumulation order ~1e-6).
+def _gen_split_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp):
+    nD_qk = oz1fp_params(nmp_qk, w_qk)[0]
+    nD_pv = oz1fp_params(nmp_pv, w_pv)[0]
+    ib_qk = w_qk * nD_qk - 1
+    ib_pv = w_pv * nD_pv - 1
+    plan_qk = pack_plan(nmp_qk, w_qk)
+    plan_pv = pack_plan(nmp_pv, w_pv)
+    L, L2 = "        ", "            "
+    lo_qk, hi_qk = -(1 << ib_qk), (1 << ib_qk) - 1
+    lo_pv, hi_pv = -(1 << ib_pv), (1 << ib_pv) - 1
+    qk_body = f'''        qk = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+        for dc in range(0, HEAD_DIM, KQ):
+            offc = dc + tl.arange(0, KQ)
+            cmask = offc < HEAD_DIM
+            qc = tl.load(Q + pid_z * sqz + offm[:, None] * sqn + offc[None, :] * sqd,
+                         mask=mmask[:, None] & cmask[None, :], other=0.0)
+            qsc = _bfp_scale(tl.max(tl.abs(qc), axis=1).to(tl.float32), {ib_qk})
+            qI = (qc / qsc[:, None] + tl.where(qc >= 0, 0.5, -0.5)).to(tl.int32)
+            qI = tl.minimum(tl.maximum(qI, {lo_qk}), {hi_qk})
+{_emit_peel("q", "qI", w_qk, nD_qk, no_clamp, L2)}
+            kc = tl.load(K + pid_z * skz + offn[:, None] * skn + offc[None, :] * skd,
+                         mask=nmask[:, None] & cmask[None, :], other=0.0)
+            ksc = _bfp_scale(tl.max(tl.abs(kc), axis=1).to(tl.float32), {ib_qk})
+            kI = (kc / ksc[:, None] + tl.where(kc >= 0, 0.5, -0.5)).to(tl.int32)
+            kI = tl.minimum(tl.maximum(kI, {lo_qk}), {hi_qk})
+{_emit_peel("k", "kI", w_qk, nD_qk, no_clamp, L2)}
+            cacc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+{_emit_dots("cacc", plan_qk, "q", "k", True, L2)}
+            qk += cacc * qsc[:, None] * ksc[None, :]
+        qk = qk * sm_scale'''
+    tail = f'''        qk = tl.where(nmask[None, :], qk, -float("inf"))
+        if CAUSAL:
+            qk = tl.where((Q_OFF + offm // GQA_G)[:, None] >= offn[None, :], qk, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        v = tl.load(V + pid_z * svz + offn[:, None] * svn + offd[None, :] * svd,
+                    mask=nmask[:, None] & dmask[None, :], other=0.0)
+        p = p.to(tl.bfloat16)
+        psc = _bfp_scale(tl.max(p, axis=1).to(tl.float32), {ib_pv})
+        vsc = _bfp_scale(tl.max(tl.abs(v), axis=0).to(tl.float32), {ib_pv})
+        pI = (p / psc[:, None] + 0.5).to(tl.int32)
+        pI = tl.minimum(pI, {hi_pv})
+        vI = (v / vsc[None, :] + tl.where(v >= 0, 0.5, -0.5)).to(tl.int32)
+        vI = tl.minimum(tl.maximum(vI, {lo_pv}), {hi_pv})
+{_emit_peel("pp", "pI", w_pv, nD_pv, no_clamp, L)}
+{_emit_peel("vv", "vI", w_pv, nD_pv, no_clamp, L)}
+        pv = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
+{_emit_dots("pv", plan_pv, "pp", "vv", False, L)}
+        pv = pv * psc[:, None] * vsc[None, :]
+        acc = acc * alpha[:, None] + pv
+        m_i = m_new'''
+    src = f'''
+@triton.jit
+def _flash_split(
+    Q, K, V, Mp, Lp, Accp, sm_scale, Z, N_CTX, Q_LEN, Q_OFF, KVLEN,
+    sqz, sqn, sqd, skz, skn, skd, svz, svn, svd,
+    smz, sms, smm, slz, sls, slm, saz, sas, sam, sad,
+    HEAD_DIM: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    CAUSAL: tl.constexpr, GQA_G: tl.constexpr, KQ: tl.constexpr, HAS_KVLEN: tl.constexpr,
+    N_SPLITS: tl.constexpr,
+):
+    pid_m = tl.program_id(0); pid_z = tl.program_id(1); pid_s = tl.program_id(2)
+    if HAS_KVLEN:
+        kvlen = tl.load(KVLEN + pid_z)
+    else:
+        kvlen = N_CTX
+    offm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offd = tl.arange(0, BLOCK_D)
+    dmask = offd < HEAD_DIM
+    mmask = offm < Q_LEN
+    if CAUSAL:
+        last_m = tl.minimum((pid_m + 1) * BLOCK_M, Q_LEN) - 1
+        n_end = tl.minimum(Q_OFF + last_m // GQA_G + 1, kvlen)
+    else:
+        n_end = kvlen
+    sblk = tl.cdiv(tl.cdiv(n_end, BLOCK_N), N_SPLITS)         # kv tiles per split
+    kv_start = pid_s * sblk * BLOCK_N
+    kv_end = tl.minimum((pid_s + 1) * sblk * BLOCK_N, n_end)  # empty (start>=end) => partial stays (-inf,0,0)
+    m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
+    for n0 in range(kv_start, kv_end, BLOCK_N):
+        offn = n0 + tl.arange(0, BLOCK_N)
+        nmask = offn < kvlen
+{qk_body}
+{tail}
+    tl.store(Mp + pid_z * smz + pid_s * sms + offm * smm, m_i, mask=mmask)
+    tl.store(Lp + pid_z * slz + pid_s * sls + offm * slm, l_i, mask=mmask)
+    tl.store(Accp + pid_z * saz + pid_s * sas + offm[:, None] * sam + offd[None, :] * sad,
+             acc, mask=mmask[:, None] & dmask[None, :])
+'''
+    return src
+
+
+@triton.jit
+def _flash_combine(
+    Mp, Lp, Accp, Out, Z, Q_LEN,
+    smz, sms, smm, slz, sls, slm, saz, sas, sam, sad, soz, son, sod,
+    HEAD_DIM: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_M: tl.constexpr, N_SPLITS: tl.constexpr,
+):
+    """Log-sum-exp merge of the N_SPLITS partial (m,l,acc): global m=max_s m_s; out=(sum_s acc_s*
+    exp(m_s-m)) / (sum_s l_s*exp(m_s-m)). Empty splits stored (-inf,0,0) contribute exp(-inf)=0."""
+    pid_m = tl.program_id(0); pid_z = tl.program_id(1)
+    offm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offd = tl.arange(0, BLOCK_D)
+    mmask = offm < Q_LEN
+    dmask = offd < HEAD_DIM
+    m = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    for s in range(N_SPLITS):
+        ms = tl.load(Mp + pid_z * smz + s * sms + offm * smm, mask=mmask, other=-float("inf"))
+        m = tl.maximum(m, ms)
+    l = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
+    for s in range(N_SPLITS):
+        ms = tl.load(Mp + pid_z * smz + s * sms + offm * smm, mask=mmask, other=-float("inf"))
+        ls = tl.load(Lp + pid_z * slz + s * sls + offm * slm, mask=mmask, other=0.0)
+        accs = tl.load(Accp + pid_z * saz + s * sas + offm[:, None] * sam + offd[None, :] * sad,
+                       mask=mmask[:, None] & dmask[None, :], other=0.0)
+        alpha = tl.exp(ms - m)
+        l += ls * alpha
+        acc += accs * alpha[:, None]
+    acc = acc / l[:, None]
+    tl.store(Out + pid_z * soz + offm[:, None] * son + offd[None, :] * sod,
+             acc.to(Out.dtype.element_ty), mask=mmask[:, None] & dmask[None, :])
+
+
+_SPLIT_KERNEL_CACHE = {}
+
+
+def _get_split_kernel(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp):
+    key = (nmp_qk, w_qk, nmp_pv, w_pv, no_clamp)
+    if key not in _SPLIT_KERNEL_CACHE:
+        src = _gen_split_src(*key)
+        fname = f"<flash_split_{key}>"
+        linecache.cache[fname] = (len(src), None, src.splitlines(keepends=True), fname)
+        ns = {"triton": triton, "tl": tl, "_bfp_scale": _bfp_scale}
+        exec(compile(src, fname, "exec"), ns)
+        _SPLIT_KERNEL_CACHE[key] = ns["_flash_split"]
+    return _SPLIT_KERNEL_CACHE[key]
+
+
+def flash_oz1fp_cg_splitkv(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scale=None,
+                           byte_split_style="all_signed_no_clamp", chunk_size=32, n_splits=8,
+                           BLOCK_M=64, num_warps=4, num_stages=1, kv_lens=None):
+    """Split-KV / flash-decoding variant of flash_oz1fp_cg (non-cached, chunk=32). Partitions the kv
+    loop into n_splits program-z slices to raise occupancy at decode (small B*Hkv grid), then merges
+    the partials by log-sum-exp. Same numerics as flash_oz1fp_cg to fp-accumulation order (each split
+    is whole BLOCK_N tiles -> identical per-tile block-FP). Intended for decode (q_len small); prefill
+    already has enough parallelism. Falls back to n_splits=1 == the plain path (one slice)."""
+    nmp_pv = nmp if nmp_pv is None else nmp_pv
+    w_pv = w if w_pv is None else w_pv
+    no_clamp = 1 if byte_split_style == "all_signed_no_clamp" else 0
+    B, Hq, T, D = q.shape
+    Hkv, N = k.shape[1], k.shape[2]
+    G = Hq // Hkv
+    assert Hq == Hkv * G, f"Hq={Hq} not a multiple of Hkv={Hkv}"
+    if sm_scale is None:
+        sm_scale = 1.0 / (D ** 0.5)
+    KQ = triton.next_power_of_2(min(chunk_size, D))
+    assert KQ < D, "split-KV requires chunk_size < head_dim (the chunked path)"
+    BLOCK_N = triton.next_power_of_2(chunk_size)
+    Qrows = T * G
+    qz = (q.reshape(B * Hkv, T, D) if G == 1 else
+          q.reshape(B, Hkv, G, T, D).permute(0, 1, 3, 2, 4).reshape(B * Hkv, Qrows, D)).contiguous()
+    kz, vz = (t.reshape(B * Hkv, N, D).contiguous() for t in (k, v))
+    Zc = B * Hkv
+    BLOCK_M = max(16, min(BLOCK_M, triton.next_power_of_2(Qrows)))
+    BD = triton.next_power_of_2(D)
+    Mp = torch.full((Zc, n_splits, Qrows), -float("inf"), device=q.device, dtype=torch.float32)
+    Lp = torch.zeros((Zc, n_splits, Qrows), device=q.device, dtype=torch.float32)
+    Accp = torch.zeros((Zc, n_splits, Qrows, D), device=q.device, dtype=torch.float32)
+    o = torch.empty_like(qz)
+    kern = _get_split_kernel(nmp, w, nmp_pv, w_pv, no_clamp)
+    has_kvlen = kv_lens is not None
+    kvlen_z = (kv_lens.to(device=q.device, dtype=torch.int32).reshape(B).repeat_interleave(Hkv).contiguous()
+               if has_kvlen else qz)
+    kern[(triton.cdiv(Qrows, BLOCK_M), Zc, n_splits)](
+        qz, kz, vz, Mp, Lp, Accp, sm_scale, Zc, N, Qrows, N - T, kvlen_z,
+        qz.stride(0), qz.stride(1), qz.stride(2), kz.stride(0), kz.stride(1), kz.stride(2),
+        vz.stride(0), vz.stride(1), vz.stride(2),
+        Mp.stride(0), Mp.stride(1), Mp.stride(2), Lp.stride(0), Lp.stride(1), Lp.stride(2),
+        Accp.stride(0), Accp.stride(1), Accp.stride(2), Accp.stride(3),
+        HEAD_DIM=D, BLOCK_D=BD, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        CAUSAL=causal, GQA_G=G, KQ=KQ, HAS_KVLEN=has_kvlen, N_SPLITS=n_splits,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    _flash_combine[(triton.cdiv(Qrows, BLOCK_M), Zc)](
+        Mp, Lp, Accp, o, Zc, Qrows,
+        Mp.stride(0), Mp.stride(1), Mp.stride(2), Lp.stride(0), Lp.stride(1), Lp.stride(2),
+        Accp.stride(0), Accp.stride(1), Accp.stride(2), Accp.stride(3),
+        o.stride(0), o.stride(1), o.stride(2),
+        HEAD_DIM=D, BLOCK_D=BD, BLOCK_M=BLOCK_M, N_SPLITS=n_splits, num_warps=4,
+    )
+    if G == 1:
+        return o.reshape(B, Hq, T, D)
+    return o.reshape(B, Hkv, T, G, D).permute(0, 1, 3, 2, 4).reshape(B, Hq, T, D)

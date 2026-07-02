@@ -447,12 +447,32 @@ eager-ref 대비 relerr 모두 **불변**(2.5e-3) → production-faithful 유지
 **ncu 재측정으로 기전 확증:** prefill ALU 56.4→**51.5%**(1230→973µs), decode ALU 48.4→**44.1%** + DRAM
 24→**30%**(1460→1210µs). 병목 ALU를 줄여 덜 ALU-bound가 되고(메모리 쪽으로 회귀) 그만큼 빨라졌다 — 예측대로.
 
-### F.5 남은 레버 (프로파일 근거, 미적용)
-- decode는 여전히 ALU-bound(44%)·occ 12.6%(레지스터 2 block/SM + 작은 grid). **가장 큰 잔여 레버 = split-KV /
-  flash-decoding**(grid↑→occupancy↑→ALU를 놀고 있는 메모리 파이프(DRAM 30% vs exact 96%) 뒤로 은닉). 이론상
-  ALU-floor ~2× 근접 가능, 단 combine(LSE) 커널 추가로 규모/리스크 큼.
+### F.5 최적화 2: **split-KV / flash-decoding** (decode occupancy, `flash_oz1fp_cg_splitkv`)
+F.4로도 decode는 여전히 ALU-bound(44%)·occ ~13%다. 원인은 레지스터 2 block/SM **+ 작은 grid**(Z=B·Hkv
+프로그램이 84 SM을 못 채움 → DRAM 30%로 놀고 ALU가 은닉 못 됨). **kv 루프를 N_SPLITS개 program-z 슬라이스로
+쪼개**(grid에 S축 추가) 각자 부분 online-softmax `(m,l,acc)`를 내고, `_flash_combine`이 log-sum-exp로 병합한다.
+동시 프로그램↑ → occupancy↑ → ALU가 놀던 메모리 파이프 뒤로 은닉. chunk=32 전용, 각 split은 BLOCK_N 타일의
+정수배라 타일별 block-FP는 non-split과 **동일**.
+
+**정확성:** S=1 == non-split **비트동일(0.0)**(combine 항등 확인); S>1은 fp32-exact 대비 **2.1–2.3e-3 = non-split과
+동일 정확도**(split↔non-split 2.5e-3은 두 valid fp 순서의 bf16 출력 반올림). `kv_lens`(vLLM 패딩 decode) 경로도
+per-seq fp32 대비 2.1e-3 정상.
+
+**속도 (decode GQA Hq28/Hkv4 w4 nmp10, ms/call; non-split은 이미 F.4 병렬 peel 적용본):**
+| B / N | non-split | split-KV (best S) | 배속 |
+|---|---|---|---|
+| B=8 N=4096   | 0.917 | **0.239** (S=32) | **3.83×** |
+| B=32 N=2048  | 0.606 | **0.450** (S=8)  | 1.35× |
+| B=32 N=4096  | 1.288 | **0.883** (S=16) | 1.46× |
+| B=64 N=4096  | 2.375 | **1.735** (S=16) | 1.37× |
+
+이득은 **grid가 굶주릴수록 큼**(B=8 → Z=32 프로그램 ≪ 84 SM → **3.8×**; B=64 → Z=256 이미 차서 1.37×) — F.5의
+"작은 grid" 진단과 정확히 일치. F.4 병렬 peel 위에 곱해지는 이득이다. `n_splits`는 명시 인자(휴리스틱: `Z·S`가
+SM 수의 몇 배가 되도록, decode 짧은 배치엔 8–32).
+
+### F.6 남은 레버
 - prefill `num_stages=3` = 추가 1.11×(bit-exact) — 단 prefill은 eval의 ~0%.
-- 근본 바닥: int8 에뮬레이션 = 정수 ALU 그 자체 → 큰 이득은 실제 int8 HW나 더 적은 자릿수(정확도 tradeoff).
+- 근본 바닥: int8 에뮬레이션 = 정수 ALU 그 자체 → 더 큰 이득은 실제 int8 HW나 더 적은 자릿수(정확도 tradeoff).
   이제 이 결론은 블랙박스 추론이 아니라 **ncu로 HW 규명된 사실**이다.
 
 ---
@@ -461,7 +481,8 @@ eager-ref 대비 relerr 모두 **불변**(2.5e-3) → production-faithful 유지
 0. **직접 프로파일링(Part F)**: ncu로 병목을 파이프 레벨 규명 — exact는 prefill=텐서 / **decode=DRAM 96%(메모리
    bound)**, ozaki는 둘 다 **정수 ALU-bound**(int8 SW 에뮬레이션)로 저-occupancy라 은닉 실패 → prefill 6×/decode 4×.
    MATH-500 병목은 **decode**(작업량 3333× prefill). 병렬 balanced-digit peel로 ALU를 줄여 **bit-exact 1.2×**(decode
-   포함) 달성, ncu로 ALU% 감소 확증. 잔여 최대 레버는 decode split-KV.
+   포함) 달성, ncu로 ALU% 감소 확증. 추가로 **split-KV/flash-decoding**(`flash_oz1fp_cg_splitkv`)으로 decode
+   occupancy를 올려 작은 배치에서 **최대 3.8×**(B=8), 큰 배치 1.35–1.46× (S=1은 non-split과 비트동일).
 1. **Faithful (chunk=32)**: 역양자화 피연산자는 production과 **비트동일**, 출력은 **fp32 누산 바닥**까지 일치
    (정확도 `== production`). int8-HW 자릿수 범위도 지켜진다.
 2. **어텐션 정확도**: flash-ozaki(nmp10, chunk=32)는 bf16 SDPA/flash-exact와 **동일**(1.99e-3, vs fp32-exact).

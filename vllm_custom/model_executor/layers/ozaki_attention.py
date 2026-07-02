@@ -290,17 +290,37 @@ class OzakiAttentionImpl(XFormersImpl):
                     "attention QK^T/PV via ozaki", os.getpid(), p["nmp"], p["rslt_type"],
                     "flash" if self._oz_flash else "eager")
 
-    def _flash(self, q4, k4, v4, name, kv_lens=None):
+    def _flash(self, q4, k4, v4, name, kv_lens=None, split_kv=False):
         """Ozaki1_fp Triton flash kernel. q4:[B,Hq,T,D]; k4,v4:[B,Hkv,N,D] (GQA folded internally).
         Causal online-softmax; kv_lens[B] masks padded decode positions. Returns [B,Hq,T,D].
         Per-op nmp: QK^T (attn_score) resolves nmp_overrides against "<name>.attn_weights", P@V
-        (attn_output) against "<name>.attn_output" -- matching the eager batched_gemm op names."""
+        (attn_output) against "<name>.attn_output" -- matching the eager batched_gemm op names.
+
+        split_kv (decode only): use flash-decoding (flash_oz1fp_cg_splitkv) -- the B*Hkv decode grid is
+        too small to fill the SMs, so the ALU-bound ozaki emulation can't hide behind the KV-read memory
+        (ncu: decode ALU ~44%, DRAM ~30% vs exact 96%). Splitting the kv loop into n_splits program-z
+        slices + an LSE combine raises occupancy; n_splits is auto-sized to ~oversubscribe the SMs. Same
+        numerics as the non-split path (n_splits=1 is bit-identical)."""
         from flash_ozaki.flash_oz1fp_codegen import flash_oz1fp_cg
-        p = self._oz_p; w = p["gemm_bits"]
+        p = self._oz_p; w = p["gemm_bits"]; cs = p["chunk_size"]
         nmp_qk = _resolve_nmp(name + ".attn_weights", self._oz_ovr, p["nmp"])
         nmp_pv = _resolve_nmp(name + ".attn_output", self._oz_ovr, p["nmp"])
+        D = q4.shape[-1]
+        if split_kv and q4.shape[2] == 1 and cs is not None and cs < D:   # decode + chunked path only
+            import triton
+            from flash_ozaki.flash_oz1fp_codegen import flash_oz1fp_cg_splitkv
+            B, Hkv, N = q4.shape[0], k4.shape[1], k4.shape[2]
+            nsm = torch.cuda.get_device_properties(q4.device).multi_processor_count
+            zc = max(1, B * Hkv)
+            n_tiles = max(1, -(-N // triton.next_power_of_2(cs)))         # ceil(N / BLOCK_N)
+            n_splits = max(1, min(-(-16 * nsm // zc), n_tiles, 32))       # ~oversubscribe SMs, capped
+            if n_splits > 1:
+                return flash_oz1fp_cg_splitkv(q4, k4, v4, nmp=nmp_qk, w=w, nmp_pv=nmp_pv, w_pv=w,
+                                              causal=True, sm_scale=self.scale, chunk_size=cs,
+                                              byte_split_style=p["byte_split_style"], kv_lens=kv_lens,
+                                              n_splits=n_splits)
         return flash_oz1fp_cg(q4, k4, v4, nmp=nmp_qk, w=w, nmp_pv=nmp_pv, w_pv=w, causal=True,
-                              sm_scale=self.scale, chunk_size=p["chunk_size"],
+                              sm_scale=self.scale, chunk_size=cs,
                               byte_split_style=p["byte_split_style"], kv_lens=kv_lens)
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata, output=None):
@@ -392,7 +412,8 @@ class OzakiAttentionImpl(XFormersImpl):
                     # seq_len were gathered from clamped/garbage slots but n_end+mask never touch them).
                     o4 = self._flash(dq[:, :, None, :],                        # [d,nH,1,hd]
                                      K.permute(0, 2, 1, 3), V.permute(0, 2, 1, 3),  # [d,nKV,Lm,hd]
-                                     layer.layer_name, kv_lens=seq_lens)       # [d,nH,1,hd]
+                                     layer.layer_name, kv_lens=seq_lens,       # [d,nH,1,hd]
+                                     split_kv=True)                            # flash-decoding (occupancy)
                     out[nq + s0:nq + e0] = o4.reshape(d, nH, hd)
                 else:
                     # GQA-grouped: keep K/V at nKV heads (do NOT repeat to nH); treat each KV
