@@ -162,19 +162,36 @@ def pack_plan(nmp, w):
 def _emit_peel(prefix, src, w, nD, no_clamp, ind):
     """Emit a single low->high digit peel producing NAMED place-folded bf16 planes
     {prefix}p0..{prefix}p{nD-1}, where {prefix}p{t} = signed_digit_t * 2^(w*t) (absolute place folded
-    in -> bf16-exact). One peel, O(nD) -- vs the hand-rolled kernel's O(nD^2) repeated _signed_digit."""
+    in -> bf16-exact). One peel, O(nD) -- vs the hand-rolled kernel's O(nD^2) repeated _signed_digit.
+
+    For the no_clamp datapath (the flash default, all_signed_no_clamp), the digits are emitted by the
+    PARALLEL balanced-digit "bias trick" instead of the sequential borrow peel: with the constant
+    B = 2^(w-1) * (2^(w(nD-1))-1)/(2^w-1) and z = src + B,
+        d_t = ((z >> (w*t)) & (2^w-1)) - 2^(w-1)   (t < nD-1),   d_{nD-1} = z >> (w*(nD-1)).
+    Each digit is an INDEPENDENT shift+and+sub (no `cur = (cur-d)>>w` borrow chain, no where-select),
+    so the peel has fewer integer-ALU ops and full ILP -- ncu shows flash_ozaki is ALU-bound on exactly
+    this integer work at low occupancy, and the parallel form is ~1.2-1.3x faster, BIT-IDENTICAL to the
+    sequential peel (verified vs _digit_planes across w/nD incl. boundary values). The sequential peel is
+    kept for the (non-flash) clamp styles where the top digit is clamped, not an unclamped remainder."""
     base, half = (1 << w), (1 << (w - 1))
+    if no_clamp:
+        B = half * ((1 << (w * (nD - 1))) - 1) // (base - 1) if nD > 1 else 0
+        L = [f"{ind}{prefix}_z = {src} + {B}"]
+        for t in range(nD):
+            if t == nD - 1:
+                d = f"({prefix}_z >> {w * (nD - 1)})"             # top digit = unclamped remainder
+            else:
+                d = f"((({prefix}_z >> {w * t}) & {base - 1}) - {half})"
+            L.append(f"{ind}{prefix}p{t} = ({d} * {1 << (w * t)}).to(tl.bfloat16)")
+        return "\n".join(L)
     L, cur = [], src
     for t in range(nD):
-        if t == nD - 1 and no_clamp:
-            d = cur                                              # top digit = unclamped remainder
-        else:
-            L.append(f"{ind}{prefix}_lo = {cur} & {base - 1}")
-            L.append(f"{ind}{prefix}d{t} = tl.where({prefix}_lo >= {half}, {prefix}_lo - {base}, {prefix}_lo)")
-            d = f"{prefix}d{t}"
-            if t != nD - 1:
-                L.append(f"{ind}{prefix}_c{t} = ({cur} - {prefix}d{t}) >> {w}")
-                cur = f"{prefix}_c{t}"
+        L.append(f"{ind}{prefix}_lo = {cur} & {base - 1}")
+        L.append(f"{ind}{prefix}d{t} = tl.where({prefix}_lo >= {half}, {prefix}_lo - {base}, {prefix}_lo)")
+        d = f"{prefix}d{t}"
+        if t != nD - 1:
+            L.append(f"{ind}{prefix}_c{t} = ({cur} - {prefix}d{t}) >> {w}")
+            cur = f"{prefix}_c{t}"
         L.append(f"{ind}{prefix}p{t} = ({d} * {1 << (w * t)}).to(tl.bfloat16)")
     return "\n".join(L)
 

@@ -390,7 +390,78 @@ vLLM 처리량은 **KV 캐시 용량**(동시 시퀀스 수 × 컨텍스트 길�
 
 ---
 
+## Part F — Nsight Compute 직접 프로파일링 + 병목 최적화 (2026-07-02, A6000)
+
+Part A~E는 wall-clock config 스윕(블랙박스)으로 오버헤드를 "구조적"이라 결론냈지만 **HW 파이프라인을 직접
+측정한 적이 없다.** `ncu`(Nsight Compute 2024.1.1, `--clock-control none`)로 flash-ozaki(`_flash_cg`) vs
+flash-exact(`_flash_exact_fwd`)를 **동일 형상에서 직접 프로파일링**해 병목을 파이프 레벨로 규명하고, 그
+병목(정수 ALU)을 직접 겨냥한 최적화를 적용했다. (프로파일 스크립트는 세션 스크래치, 결과는 아래 표.)
+
+### F.1 병목 파이프 규명 (ncu, nmp10 w4 chunk=32)
+| regime | 커널 | Duration | 최고 파이프 | DRAM% | occ% | 결론 |
+|---|---|---|---|---|---|---|
+| PREFILL N=1024 | exact | 194µs | Tensor(양호) | 20.6 | 15.3 | 레이턴시/occ-bound (D=128 레지스터压) |
+| PREFILL N=1024 | **ozaki** | 1230µs | **ALU 56.4%** | **5.0** | 15.4 | **정수 ALU-bound** (자릿수 peel+block-FP quant) |
+| DECODE N=4096 | exact | 370µs | — | **95.9** | 12.8 | **메모리-bound** (KV 스트리밍, DRAM≈peak) |
+| DECODE N=4096 | **ozaki** | 1460µs | **ALU 48.4%** | **24.4** | 12.7 | **정수 ALU-bound** (메모리 파이프 굶김) |
+
+**속도차 정당화:** flash-exact는 prefill=텐서코어, **decode=DRAM 대역폭(96%)** 에 bound된, 어텐션이 마땅히
+그래야 할 커널이다. flash-ozaki는 그 위에 **int8 데이터패스의 SW 에뮬레이션(정수 자릿수 분해 + block-FP 양자화)**
+을 얹어 **정수 ALU 파이프**를 병목으로 만든다(prefill ALU 56%/DRAM 5%, decode ALU 48%/DRAM 24%). 게다가
+occupancy가 ~13~15%(레지스터压으로 2 block/SM, decode는 grid=B·Hkv도 작음)라 그 ALU 작업이 **메모리/텐서 뒤로
+숨지 못하고 직렬로 얹혀** prefill ~6×, decode ~4×가 된다. 즉 오버헤드는 "구조적"이 아니라 **구체적으로 정수 ALU**다.
+
+### F.2 op-구간 분해 (2×2 differential timing, 커널과 bit-exact)
+QK/PV를 각각 ozaki/plain으로 토글(공유 softmax·GQA·causal 동일). exact 대비 배속:
+- PREFILL N=2048: QK-only 4.2× / PV-only 3.7× / full 6.7×; QK를 encode+1dot로 자르면 2.3× → **QK encode ~1.3×,
+  QK multi-dot ~1.9×**(다중 dot이 encode보다 큼), PV ≈ QK. **단일 지배 op 없음** — 비용이 4개(QK enc/dot,
+  PV enc/dot)에 고루 퍼져 있다.
+- DECODE B32 N4096: QK-only 2.5× / PV-only 2.3× / full 4.0×; encode/dot 대략 반반. B64에선 encode 비중 하락
+  (warp가 늘어 은닉↑) → 레이턴시/occupancy 성분 확인.
+
+### F.3 MATH-500 실서빙 병목 = **decode** (prefill 아님)
+실제 nmp10 attn_only MATH-500 출력 120건 토크나이즈: prompt 평균 92 tok / generation 평균 4368 tok(중앙값
+2568, 최대 32601). 어텐션 작업량(∝위치수)은 **decode/prefill = 3333×**(중앙값 1378×), 선형층조차 47×. 추론모델은
+프롬프트의 ~50배를 생성하고 어텐션은 위치에 대해 2차이므로 **~4h eval은 사실상 전부 decode**다(prefill <0.1%).
+→ 최적화 우선순위는 decode.
+
+### F.4 최적화: **병렬 balanced-digit peel** (병목 ALU 직접 감축, bit-exact)
+`_emit_peel`의 직렬 borrow peel(`cur=(cur-d)>>w` + `where`-select, 자릿수마다 순차 의존)을 **bias-trick 병렬형**
+으로 교체: `z = src + B` (B=2^(w-1)·(2^(w(nD-1))−1)/(2^w−1)), `d_t = ((z>>wt) & (2^w−1)) − 2^(w-1)` (t<nD−1),
+최상위 `= z>>(w(nD−1))`. 각 자릿수가 **독립**(borrow 체인 제거) + `where` 제거 → **정수 ALU op 감소 + ILP 상승**,
+F.1에서 규명한 정확한 병목을 겨냥. `no_clamp`(flash 기본) 전용, 다른 clamp 스타일은 기존 직렬 peel 유지.
+`_gen_src`·`_gen_cached_src` 공용이라 non-cached/cached 모두, vLLM 백엔드도 자동 적용(API 무변).
+
+**Bit-identical 검증:** _digit_planes(직렬 torch twin) 대비 모든 w/nD(경계값 포함) `torch.equal`; decomp full vs
+실커널 `0.0`; cached vs non-cached ~1e-6(기존과 동일한 fp 누산순서, E.3). 정확도(vs fp32-exact) 및 production
+eager-ref 대비 relerr 모두 **불변**(2.5e-3) → production-faithful 유지.
+
+**속도(실 `flash_oz1fp_cg`, CUDA-event):**
+| regime | 기존(직렬) | 병렬 peel | 배속 | oz/exact |
+|---|---|---|---|---|
+| PREFILL nmp10 N2048 | 4.12ms | **3.41ms** | 1.21× | 6.5→5.4× |
+| PREFILL nmp10 N4096 | 15.26ms | **12.64ms** | 1.21× | 6.6→5.5× |
+| DECODE nmp10 B32 N4096 | 1.55ms | **1.30ms** | 1.19× | 4.2→3.5× |
+| DECODE nmp15 B32 N4096 | 1.59ms | **1.27ms** | 1.26× | — |
+
+**ncu 재측정으로 기전 확증:** prefill ALU 56.4→**51.5%**(1230→973µs), decode ALU 48.4→**44.1%** + DRAM
+24→**30%**(1460→1210µs). 병목 ALU를 줄여 덜 ALU-bound가 되고(메모리 쪽으로 회귀) 그만큼 빨라졌다 — 예측대로.
+
+### F.5 남은 레버 (프로파일 근거, 미적용)
+- decode는 여전히 ALU-bound(44%)·occ 12.6%(레지스터 2 block/SM + 작은 grid). **가장 큰 잔여 레버 = split-KV /
+  flash-decoding**(grid↑→occupancy↑→ALU를 놀고 있는 메모리 파이프(DRAM 30% vs exact 96%) 뒤로 은닉). 이론상
+  ALU-floor ~2× 근접 가능, 단 combine(LSE) 커널 추가로 규모/리스크 큼.
+- prefill `num_stages=3` = 추가 1.11×(bit-exact) — 단 prefill은 eval의 ~0%.
+- 근본 바닥: int8 에뮬레이션 = 정수 ALU 그 자체 → 큰 이득은 실제 int8 HW나 더 적은 자릿수(정확도 tradeoff).
+  이제 이 결론은 블랙박스 추론이 아니라 **ncu로 HW 규명된 사실**이다.
+
+---
+
 ## 핵심 결론
+0. **직접 프로파일링(Part F)**: ncu로 병목을 파이프 레벨 규명 — exact는 prefill=텐서 / **decode=DRAM 96%(메모리
+   bound)**, ozaki는 둘 다 **정수 ALU-bound**(int8 SW 에뮬레이션)로 저-occupancy라 은닉 실패 → prefill 6×/decode 4×.
+   MATH-500 병목은 **decode**(작업량 3333× prefill). 병렬 balanced-digit peel로 ALU를 줄여 **bit-exact 1.2×**(decode
+   포함) 달성, ncu로 ALU% 감소 확증. 잔여 최대 레버는 decode split-KV.
 1. **Faithful (chunk=32)**: 역양자화 피연산자는 production과 **비트동일**, 출력은 **fp32 누산 바닥**까지 일치
    (정확도 `== production`). int8-HW 자릿수 범위도 지켜진다.
 2. **어텐션 정확도**: flash-ozaki(nmp10, chunk=32)는 bf16 SDPA/flash-exact와 **동일**(1.99e-3, vs fp32-exact).
