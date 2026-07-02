@@ -313,6 +313,33 @@ ozaki 없는 순수 bf16 Triton GEMM을 타일링별로 cuBLAS `torch.bmm`과 �
 큰 compute-bound GEMM은 ozaki 자릿수-평면 SRAM 압력으로 큰 타일을 못 써 cuBLAS(production) 유리, 저강도
 어텐션 형상에선 fused-Triton 유리.
 
+### D.1 mine vs prod op-by-op + 커널 분해 (torch profiler, idle gpu, 2026-07-02)
+같은 ozaki1_fp A@B(둘 다 병렬 peel, bit-exact)를 **연산 단위로** 추적:
+- **mine** (`oz1fp_gemm_cg`): **커널 1개**. program당 K-chunk 루프에서 A/B를 **한 번 읽어** 인라인 인코드(peel)
+  → #G개 plan-dot를 **레지스터 `cacc`에 누적** → `acc += cacc·sA·sB` → C 1회 store. 중간결과 HBM 왕복 없음.
+- **prod** (`ozaki1_batched_gemm_fp`): **커널 #G+3개**. `wbit_super_encode_A`+`_B`(CUDA 인코드) → **rectangle당
+  cuBLAS bf16 GEMM #G개**(각각 super-plane 피연산자를 HBM에서 재-read, [b,m,n] fp32 partial을 HBM에 write) →
+  `combine_cast`(#G개 partial을 재-read해 가중합).
+
+**커널별 시간 (us/call, w4 nmp10):**
+| | ATTN QK (Z28 M1024 K128 N1024) | LINEAR gate_up (M2048 K3584 N37888) |
+|---|---|---|
+| **mine** | **706** (1 커널) | 51369 (1 커널) |
+| **prod** | **2523** (8 커널) | 28402 (8 커널) |
+| prod 분해 | cuBLAS×5 1137 (45%) · **combine 955 (38%)** · encA 318 · encB 113 | cuBLAS×5 21428 **(75%)** · encB 3773 · combine 2519 · encA 683 |
+
+**속도차 원인 (roofline 의존, 정반대):**
+- **어텐션(저강도) → mine 3.6× 승**: prod의 `combine_cast`(38%, 955us) 하나가 mine 커널 전체(706us)보다 크다 —
+  prod는 5개 partial [28,1024,1024] fp32(~600MB)를 HBM에 쓰고 combine에서 되읽는 **순수 HBM 왕복**을 지불하는데,
+  mine은 5개 dot를 레지스터 `cacc`에 누적해 그 왕복을 **완전히 제거**. + prod는 작은 GEMM에 cuBLAS 5회 launch.
+- **linear(compute-bound) → prod 1.8× 승**: prod의 cuBLAS×5(75%)가 **256×128 타일 + 32×3 파이프**로 near-peak.
+  mine은 nD개 자릿수 평면이 상주해 BM=BN=64/CHUNK=32 작은 타일밖에 못 써 compute 효율↓ → 51.4ms vs 28.4ms.
+- **decode M=1(메모리/launch-bound) → mine 다시 승**(linear에서도 2.2–3.1×): M=1이면 cuBLAS GEMM도 GEMV(작음)라
+  prod의 #G launch+partial+combine 오버헤드 > mine의 단일 fused 커널.
+
+즉 **fused(mine)는 HBM 왕복·launch를 없애 저강도/decode에서 이기고, slot-cuBLAS(prod)는 big-tile near-peak로
+compute-bound linear prefill에서 이긴다.** (같은 이유로 flash_ozaki 어텐션 백엔드는 fused, linear는 production을 쓴다.)
+
 ---
 
 ## Part E — 사전 인코딩 KV 캐시 (`flash_oz1fp_cg_cached`, `flash_ozaki/bench_cached.py`, chunk=32)
