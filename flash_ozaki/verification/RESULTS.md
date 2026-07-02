@@ -38,6 +38,20 @@ flash-attention용 **ozaki1_fp 코드젠 커널**(`flash_oz1fp_codegen.py`: fuse
 > **flash 커널과의 관계:** 독립 GEMM과 flash 커널은 codegen의 `pack_plan`/`_emit_peel`/`_emit_dots`/
 > `_bfp_scale`를 **그대로 공유**하고, 이제 둘 다 **동일한 chunk=32** block-FP 리덕션을 쓴다.
 
+> **NOTE (2026-07-02, 병렬 peel 재측정):** 이제 **양쪽 다 병렬 balanced-digit peel 적용본**이다 — mine(독립
+> GEMM)은 공유 `_emit_peel`, production(`ozaki1_batched_gemm_fp`, `~/ozaki_npu`)은 CUDA `wbit_super_encode`
+> /Triton fold/torch split. **정확도(A.1/A.2)·mine==prod 비트동일성은 불변**(bit-exact 최적화).
+>
+> **속도 영향 — 통제 측정(serial vs parallel `.so`, idle gpu, min-over-windows) 결과:**
+> - **production은 ~1.0× (변화 없음)**: 실제 DeepSeek-7B linear(qkv/o/gate_up/down)·attn QK/PV 전부 0.99–1.03×.
+>   production encode는 **메모리-bound**(K×N weight+nD plane 스트리밍)이라 자릿수 split(소수 ALU op)을 병렬화해도
+>   메모리 뒤에 숨어 이득 없음. (초기 ad-hoc run의 2.5–3.1×는 GPU 경합/콜드스타트 아티팩트 — 통제 측정으로 정정.)
+> - **mine(fused flash)은 ~1.2×**: flash 커널은 ALU-bound(ncu Part F)라 같은 peel이 실제 이득. → mine의 기존
+>   어텐션 우위(A.3, p/m ~3×)가 peel로 소폭 더 벌어짐(mine만 ~1.2× 당겨짐, prod 불변).
+>
+> 즉 **같은 코드 변경, 반대 roofline → 반대 결과**. A.3/A.4의 절대 ms 표는 pre-peel 측정이며 지연-bound라
+> idle-GPU min-over-windows로만 신뢰(재실행 시 mine은 ~1.2× 하향, prod 거의 불변).
+
 ### A.1 충실도 (`verify_faithfulness.py`, chunk=32)
 - **역양자화 피연산자 Â가 production과 비트동일** (`torch.equal`, relerr `0.00e+00`): w4 nmp9/16, w8 nmp1, w2 nmp16.
 - **no_clamp 최상위 자릿수 ∈ `[−2^(w-1), 2^(w-1)]`** (int8 범위 + 1비트 MSB 플래그): w4 `[−8,8]`, w8 `[−128,127]`, w2 `[−2,2]`. ✔
