@@ -74,6 +74,11 @@ USE_FLASH = True                     # run attention (attn_only/full cells) thro
 #                                      unchanged (still reused from disk). Distinct run-hash from eager,
 #                                      so flash cells run FRESH (never reuse an eager result).
 LINEAR_NAMES = ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]  # vLLM-fused linear names
+# Names pinned to the LINEAR nmp (L) in an L!=A `full` cell. lm_head is a linear op (its logits GEMM is
+# now Ozaki-fied) so it must follow L, not the base --nmp (=A, the attention nmp). Its module name is
+# "lm_head", which does NOT re.search-match any of qkv/o/gate_up/down -> without this it would fall back
+# to the base nmp = A (wrong). Keep LINEAR_NAMES (4) for the _SELFCHECK legacy-hash refs below.
+OVERRIDE_NAMES = LINEAR_NAMES + ["lm_head"]
 
 # Grid axis. valid w=4 nmps are 1/3/4/6/9/10/15/16; the table uses these seven + BF16 (native).
 BF16 = "BF16"
@@ -116,8 +121,9 @@ def cell_to_run(L, A):
         return dict(placement="attn_only", nmp=A, overrides=None)
     if L == A:                                     # both emulated at the same nmp
         return dict(placement="full", nmp=L, overrides=None)
-    # both emulated, different nmp: base nmp drives attention; per-op overrides pin the linears.
-    return dict(placement="full", nmp=A, overrides={n: L for n in LINEAR_NAMES})
+    # both emulated, different nmp: base nmp drives attention; per-op overrides pin the linears
+    # (incl. lm_head) to L. attn_weights/attn_output don't match these patterns -> attention stays A.
+    return dict(placement="full", nmp=A, overrides={n: L for n in OVERRIDE_NAMES})
 
 
 def canonical_args(spec):
