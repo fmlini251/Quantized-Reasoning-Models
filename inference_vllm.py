@@ -66,11 +66,12 @@ def parser_gen():
                              '(Qwen2OzakiForCausalLM; mirrors inference_transformers.py --linear_only). '
                              'full: linear AND attention QK^T/PV via the custom eager backend. '
                              'attn_only: attention QK^T/PV only, linear stays native bf16 (stock Qwen2).')
-    parser.add_argument('--ozaki_flash', action='store_true',
+    parser.add_argument('--ozaki_flash', action=argparse.BooleanOptionalAction, default=True,
                         help='For full/attn_only: run attention through the Triton flash_ozaki kernel '
                              '(online-softmax, non-cached, GQA-fold) instead of the eager batched_gemm '
                              'path. ozaki1_fp only (else falls back to eager). Same ozaki1_fp math, '
-                             'much faster; output differs from eager by ~e-3 (bf16/P-encode granularity).')
+                             'much faster; output differs from eager by ~e-3 (bf16/P-encode granularity). '
+                             'DEFAULT ON; pass --no-ozaki_flash to use the eager batched_gemm path.')
     parser.add_argument('--rslt_type', type=str, default='ozaki1_fp',
                         choices=['ozaki1', 'ozaki1_fp', 'ozaki2', 'ozaki2_fp'],
                         help='Ozaki GEMM type (emulation name). ozaki1 / ozaki1_fp: block-FP '
