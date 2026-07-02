@@ -67,6 +67,12 @@ GEMM_BITS = 4
 BYTE_SPLIT_STYLE = "all_signed_no_clamp"
 K = 32
 WEIGHT_CACHE = True
+USE_FLASH = True                     # run attention (attn_only/full cells) through the Triton
+#                                      flash_ozaki kernel (--ozaki_flash) instead of eager batched_gemm:
+#                                      faster + avoids the eager attention runtime-OOM. Only affects
+#                                      cells whose attention is emulated; linear_only/off cells are
+#                                      unchanged (still reused from disk). Distinct run-hash from eager,
+#                                      so flash cells run FRESH (never reuse an eager result).
 LINEAR_NAMES = ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]  # vLLM-fused linear names
 
 # Grid axis. valid w=4 nmps are 1/3/4/6/9/10/15/16; the table uses these seven + BF16 (native).
@@ -77,6 +83,8 @@ ACC_FLOOR = 0.8                       # cell <= this => stop lowering nmp past i
 
 OUT_DIR = "outputs/sweep_nmp_grid"
 LOG_DIR = "logs/sweep_nmp_grid"
+RES_JSON = "results_flash.json" if USE_FLASH else "results.json"   # keep the eager grid intact
+RES_MD = "results_flash.md" if USE_FLASH else "results.md"
 INFERENCE_DIR = "outputs/inference"   # where inference_vllm.py writes its canonical hash dirs
 
 # Known-good reference hashes (config -> dir suffix) used as a startup self-check. The hash
@@ -141,6 +149,8 @@ def canonical_args(spec):
         "s": None, "s_overrides": None, "scale_method": "new_compressed",
         "shift_bits": 7, "M_frac_bits": 8, "combine_fp64": False,
     }
+    if USE_FLASH and placement in ("attn_only", "full"):
+        a["ozaki_flash"] = True          # flash-emulated attention -> distinct run-hash from eager
     return a
 
 
@@ -160,32 +170,46 @@ def legacy_jsonl(spec):
     return os.path.join(INFERENCE_DIR, make_run_tag(a), f"{DATASET}.jsonl")
 
 
+def _cell_fields(spec):
+    """The saved-args fields that DEFINE a sweep cell. Everything else inference_vllm.py writes
+    (perf flags, and newly-added hashed args -- `methods`, `kv_cache_prefill`, `weight_cache_prefill`,
+    ...) must NOT gate the match: gating on inference_vllm's FULL arg set via a hand-copied replica
+    (canonical_args) is exactly what silently broke harvest every time it gained a flag (a completed
+    run's hash then no longer matched -> 'no_output'). Values as written into <dataset>.args.json."""
+    p = spec["placement"]
+    if p == "off":
+        return {"ozaki_placement": None, "dtype": "bfloat16", "seed": 42}
+    f = {"ozaki_placement": p, "rslt_type": RSLT_TYPE, "k": K, "weight_cache": WEIGHT_CACHE,
+         "nmp": spec["nmp"], "nmp_overrides": spec["overrides"], "gemm_bits": GEMM_BITS,
+         "byte_split_style": BYTE_SPLIT_STYLE, "dtype": "bfloat16", "seed": 42}
+    if USE_FLASH and p in ("attn_only", "full"):
+        f["ozaki_flash"] = True           # flash cells must match a flash run, never the eager one
+    return f
+
+
+def _field_eq(saved, want):
+    """Saved-args value vs wanted cell-field value; bool-tolerant (missing/None counts as False)."""
+    if isinstance(want, bool):
+        return bool(saved) == want
+    return saved == want                  # None==None, int==int, dict==dict (order-independent)
+
+
 def result_jsonl(spec):
-    """Best existing result path for a spec, else the canonical path (where a fresh run lands).
-    Preference order:
-      1. canonical (current-code) hash -- where a freshly-launched run WILL land, so a run that
-         just finished is picked up here (the phantom-`methods` key used to miss this entirely,
-         silently losing the accuracy of every newly-run cell);
-      2. legacy (with-`methods`) hash  -- every result already on disk, reused not recomputed;
-      3. for the native bf16 baseline (`off`, which predates both schemes) any matching native
-         dir, so the known 0.948 is reused instead of recomputed."""
-    primary = canonical_jsonl(spec)
-    if os.path.exists(primary):
-        return primary
-    legacy = legacy_jsonl(spec)
-    if os.path.exists(legacy):
-        return legacy
-    if spec["placement"] == "off":
-        name = MODEL.rstrip("/").split("/")[-1]
-        pat = os.path.join(INFERENCE_DIR, f"model={name}__dtype=bfloat16__seed=42__*", f"{DATASET}.jsonl")
-        for j in sorted(glob.glob(pat)):
-            aj = os.path.join(os.path.dirname(j), f"{DATASET}.args.json")
-            try:
-                if json.load(open(aj)).get("ozaki_placement") is None:
-                    return j
-            except (OSError, json.JSONDecodeError):
-                continue
-    return primary
+    """Existing result jsonl for a spec, located by globbing the model's run dirs and confirming the
+    CELL-DEFINING fields in each candidate's <dataset>.args.json -- robust to inference_vllm.py adding
+    new hashed-but-non-result args (the repeated cause of 'no_output' on completed cells). Falls back
+    to the canonical path (where a fresh run will land) when nothing on disk matches yet."""
+    want = _cell_fields(spec)
+    name = MODEL.rstrip("/").split("/")[-1]
+    for j in sorted(glob.glob(os.path.join(INFERENCE_DIR, f"model={name}__*", f"{DATASET}.jsonl"))):
+        aj = os.path.join(os.path.dirname(j), f"{DATASET}.args.json")
+        try:
+            saved = json.load(open(aj))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if all(_field_eq(saved.get(k), v) for k, v in want.items()):
+            return j
+    return canonical_jsonl(spec)
 
 
 def read_accuracy(path):
@@ -214,6 +238,8 @@ def build_cmd(spec):
     cmd += ["--nmp", str(spec["nmp"])]
     if spec["overrides"]:
         cmd += ["--nmp_overrides", ",".join(f"{n}={v}" for n, v in spec["overrides"].items())]
+    if USE_FLASH and spec["placement"] in ("attn_only", "full"):
+        cmd += ["--ozaki_flash"]
     return cmd
 
 
@@ -227,6 +253,7 @@ def self_check():
     for want, (placement, nmp, ov) in _SELFCHECK.items():
         spec = dict(placement=placement, nmp=nmp, overrides=ov)
         a = dict(canonical_args(spec))
+        a.pop("ozaki_flash", None)       # refs are eager legacy; check the flash-independent base hash
         a["methods"] = None
         got = make_run_tag(a).split("__")[-1]
         if got != want:
@@ -265,10 +292,10 @@ def render_table(results):
 def write_outputs(results):
     os.makedirs(OUT_DIR, exist_ok=True)
     serial = {f"L={L}|A={A}": rec for (L, A), rec in results.items()}
-    with open(os.path.join(OUT_DIR, "results.json"), "w") as f:
+    with open(os.path.join(OUT_DIR, RES_JSON), "w") as f:
         json.dump(serial, f, indent=2, default=str)
     table = render_table(results)
-    with open(os.path.join(OUT_DIR, "results.md"), "w") as f:
+    with open(os.path.join(OUT_DIR, RES_MD), "w") as f:
         f.write(f"# Ozaki1_fp (w=4) nmp sweep — {DATASET} extractive_match\n\n")
         f.write("Rows = linear-layer nmp, cols = attention nmp, BF16 = native. "
                 f"`prune` = skipped (dominated by a <= {ACC_FLOOR} cell).\n\n```\n")
@@ -384,7 +411,8 @@ def main():
 
     print("\n" + render_table(results))
     if not args.dry_run:
-        print(f"\nWrote {OUT_DIR}/results.json and {OUT_DIR}/results.md")
+        print(f"\nWrote {OUT_DIR}/{RES_JSON} and {OUT_DIR}/{RES_MD}"
+              + ("   [FLASH attention sweep]" if USE_FLASH else ""))
 
 
 if __name__ == "__main__":
