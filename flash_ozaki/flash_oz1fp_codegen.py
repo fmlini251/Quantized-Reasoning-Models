@@ -92,17 +92,35 @@ def _digit_planes(xI, w, nD, no_clamp=True):
 _PLAN_CACHE = {}
 
 
-def pack_plan(nmp, w):
-    """Minimum signed g-bounded (g=8//w) rectangle cover of the kept (la,lb) digit-pair region.
-    Returns [(i0,i1,j0,j1,sign)] -- each is one packed bf16 GEMM of A-digit-range [i0,i1] x
-    B-digit-range [j0,j1] (span <= g -> super-digit < 2^8 -> bf16-exact), signed-combined. The place
-    value 2^(w*(i0+j0)) is folded into the planes (absolute-place convention), so no external weight.
+PACK_SIG = {"bf16": 8, "fp16": 11}          # significand bits (incl. the implicit one)
+PACK_TL = {"bf16": "tl.bfloat16", "fp16": "tl.float16"}
+PACK_TORCH = {"bf16": torch.bfloat16, "fp16": torch.float16}
+
+
+def pack_plan(nmp, w, pack_dtype="bf16"):
+    """Minimum signed g-bounded rectangle cover of the kept (la,lb) digit-pair region, with
+    g = PACK_SIG[pack_dtype] // w. Returns [(i0,i1,j0,j1,sign)] -- each is one packed GEMM of
+    A-digit-range [i0,i1] x B-digit-range [j0,j1] (span <= g -> the packed super-digit is exactly
+    representable in the pack dtype), signed-combined.
+
+    pack_dtype picks the packing width: bf16 has 8 significand bits (g = 8//w), fp16 has 11
+    (g = 11//w). fp16 therefore recovers packing for the widths that do not divide 8 -- notably
+    **w=5 goes g=1 -> g=2**, i.e. one dot per 2x2 digit-pair block instead of per cell. The exact
+    bound is maxS(w,g) = 2^(w-1)*(2^(wg)-1)/(2^w-1) <= 2^SIG, and g = SIG//w happens to hit it
+    exactly for every w in 2..8 (checked).
+
+    Place convention depends on the dtype, because it decides the EXPONENT range needed:
+      * bf16: absolute place 2^(w*t) folded into the planes -> no external weight (bf16 has fp32's
+        exponent range, so a plane of 2^int_bits is free).
+      * fp16: relative place inside the rectangle + external 2^(w*(i0+j0)) on the fp32 accumulator
+        (production's convention). fp16 caps at 65504, so an absolute-place plane would go inf for
+        int_bits >= 16; a relative super-digit only ever reaches maxS (<= 682).
     Found by IDA* (branch on rectangles covering the first uncovered cell, both signs)."""
-    key = (nmp, w)
+    key = (nmp, w, pack_dtype)
     if key in _PLAN_CACHE:
         return _PLAN_CACHE[key]
     nD, drop, _ = oz1fp_params(nmp, w)
-    g = max(1, 8 // w)
+    g = max(1, PACK_SIG[pack_dtype] // w)
     kept = {(la, lb) for la in range(nD) for lb in range(nD) if w * (la + lb) >= drop}
     cells = [(la, lb) for la in range(nD) for lb in range(nD)]
     rects = []
@@ -153,13 +171,36 @@ def pack_plan(nmp, w):
         for i in range(i0, i1 + 1):
             for j in range(j0, j1 + 1):
                 chk[(i, j)] += sgn
-    assert all(chk[c] == (1 if c in kept else 0) for c in cells), f"bad plan nmp={nmp} w={w}"
+    assert all(chk[c] == (1 if c in kept else 0) for c in cells), \
+        f"bad plan nmp={nmp} w={w} pack={pack_dtype}"
     _PLAN_CACHE[key] = plan
     return plan
 
 
+def peel_bias(w, nD):
+    """The parallel balanced-digit peel's bias B = 2^(w-1) * (2^(w(nD-1))-1)/(2^w-1) (always an
+    integer -- geometric series)."""
+    return (1 << (w - 1)) * ((1 << (w * (nD - 1))) - 1) // ((1 << w) - 1) if nD > 1 else 0
+
+
+def assert_int32_peel_fits(nmp, w):
+    """The generated kernels clamp the block-FP integer to +-2^int_bits and peel it in **int32**, so
+    2^int_bits + peel_bias must fit. int_bits = w*nD-1 grows fast: w=8 nD=4 gives 31 and w=8 nD=5
+    gives 39, both of which overflow and produce SILENT garbage (measured vs production: w8 nmp10/16
+    -> relerr 5.9e-2, w8 nmp15 -> 1.0, while production itself stays at 5e-8). Everything actually
+    used here is far below the wall -- w=4 tops out at int_bits 19 (nmp15) and w=5 at 24 (nmp15) --
+    so this only fences off the w=8 high-nD corner that was never exercised."""
+    nD, _, int_bits = oz1fp_params(nmp, w)
+    need = (1 << int_bits) + peel_bias(w, nD)
+    if need >= 2 ** 31:
+        raise ValueError(
+            f"ozaki1_fp w={w} nmp={nmp} needs int_bits={int_bits} (nD={nD}); the int32 peel would "
+            f"overflow (|z|max={need} >= 2^31) and return silently wrong results. Use a smaller w or "
+            f"nmp: at w=8 keep nmp<=9 (int_bits<=23); w=4 (<=19) and w=5 (<=24) are always safe.")
+
+
 # --- kernel source generation -----------------------------------------------------------------
-def _emit_peel(prefix, src, w, nD, no_clamp, ind):
+def _emit_peel(prefix, src, w, nD, no_clamp, ind, pack_dtype="bf16"):
     """Emit a single low->high digit peel producing NAMED place-folded bf16 planes
     {prefix}p0..{prefix}p{nD-1}, where {prefix}p{t} = signed_digit_t * 2^(w*t) (absolute place folded
     in -> bf16-exact). One peel, O(nD) -- vs the hand-rolled kernel's O(nD^2) repeated _signed_digit.
@@ -174,6 +215,8 @@ def _emit_peel(prefix, src, w, nD, no_clamp, ind):
     sequential peel (verified vs _digit_planes across w/nD incl. boundary values). The sequential peel is
     kept for the (non-flash) clamp styles where the top digit is clamped, not an unclamped remainder."""
     base, half = (1 << w), (1 << (w - 1))
+    rel = pack_dtype != "bf16"          # relative place -> keep the digits as int32, _super folds+casts
+    dt = PACK_TL[pack_dtype]
     if no_clamp:
         B = half * ((1 << (w * (nD - 1))) - 1) // (base - 1) if nD > 1 else 0
         L = [f"{ind}{prefix}_z = {src} + {B}"]
@@ -182,7 +225,8 @@ def _emit_peel(prefix, src, w, nD, no_clamp, ind):
                 d = f"({prefix}_z >> {w * (nD - 1)})"             # top digit = unclamped remainder
             else:
                 d = f"((({prefix}_z >> {w * t}) & {base - 1}) - {half})"
-            L.append(f"{ind}{prefix}p{t} = ({d} * {1 << (w * t)}).to(tl.bfloat16)")
+            L.append(f"{ind}{prefix}d{t} = {d}" if rel
+                     else f"{ind}{prefix}p{t} = ({d} * {1 << (w * t)}).to({dt})")
         return "\n".join(L)
     L, cur = [], src
     for t in range(nD):
@@ -192,32 +236,48 @@ def _emit_peel(prefix, src, w, nD, no_clamp, ind):
         if t != nD - 1:
             L.append(f"{ind}{prefix}_c{t} = ({cur} - {prefix}d{t}) >> {w}")
             cur = f"{prefix}_c{t}"
-        L.append(f"{ind}{prefix}p{t} = ({d} * {1 << (w * t)}).to(tl.bfloat16)")
+        if not rel:
+            L.append(f"{ind}{prefix}p{t} = ({d} * {1 << (w * t)}).to({dt})")
     return "\n".join(L)
 
 
-def _super(prefix, i0, i1):
-    return "(" + " + ".join(f"{prefix}p{t}" for t in range(i0, i1 + 1)) + ")"
+def _super(prefix, i0, i1, w=None, pack_dtype="bf16"):
+    """Absolute convention (bf16): the place is already in the planes, so just add them.
+    Relative convention (fp16): fold 2^(w*(t-i0)) in INT32 and cast ONCE -- multiplying an fp16
+    tensor by a python float would promote the operand to fp32 and lose the fp16 tensor cores."""
+    if pack_dtype == "bf16":
+        return "(" + " + ".join(f"{prefix}p{t}" for t in range(i0, i1 + 1)) + ")"
+    terms = [f"{prefix}d{t}" if t == i0 else f"{prefix}d{t} * {1 << (w * (t - i0))}"
+             for t in range(i0, i1 + 1)]
+    return "((" + " + ".join(terms) + f").to({PACK_TL[pack_dtype]}))"
 
 
-def _emit_dots(acc, plan, a, b, trans_b, ind):
+def _emit_dots(acc, plan, a, b, trans_b, ind, w=None, pack_dtype="bf16"):
     """Emit one explicit signed tl.dot per plan rectangle (the fused-kernel analog of the GEMM's
-    fixed named slots). place 2^(w*(i0+j0)) is already folded into the planes -> no external weight."""
+    fixed named slots). bf16: place 2^(w*(i0+j0)) is already folded into the planes -> no external
+    weight. fp16: apply it to the fp32 dot result (exact -- it is a power of two)."""
     L = []
     for (i0, i1, j0, j1, sgn) in plan:
-        bexpr = f"tl.trans({_super(b, j0, j1)})" if trans_b else _super(b, j0, j1)
+        sa = _super(a, i0, i1, w, pack_dtype)
+        sb = _super(b, j0, j1, w, pack_dtype)
+        bexpr = f"tl.trans({sb})" if trans_b else sb
         op = "+=" if sgn > 0 else "-="
-        L.append(f"{ind}{acc} {op} tl.dot({_super(a, i0, i1)}, {bexpr}, out_dtype=tl.float32)")
+        # bf16: place already folded into the planes. otherwise weight the fp32 dot result by the
+        # rectangle's place (exact -- a power of two); elide it when it is 1.
+        pe = 0 if pack_dtype == "bf16" else w * (i0 + j0)
+        scale = "" if pe == 0 else f" * {float(1 << pe)}"
+        L.append(f"{ind}{acc} {op} tl.dot({sa}, {bexpr}, out_dtype=tl.float32){scale}")
     return "\n".join(L)
 
 
-def _gen_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
+def _gen_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked, pack_dtype="bf16"):
+    assert_int32_peel_fits(nmp_qk, w_qk); assert_int32_peel_fits(nmp_pv, w_pv)
     nD_qk = oz1fp_params(nmp_qk, w_qk)[0]
     nD_pv = oz1fp_params(nmp_pv, w_pv)[0]
     ib_qk = w_qk * nD_qk - 1                                  # production int_bits = w*nD-1
     ib_pv = w_pv * nD_pv - 1
-    plan_qk = pack_plan(nmp_qk, w_qk)
-    plan_pv = pack_plan(nmp_pv, w_pv)
+    plan_qk = pack_plan(nmp_qk, w_qk, pack_dtype)
+    plan_pv = pack_plan(nmp_pv, w_pv, pack_dtype)
     I, L, L2 = "    ", "        ", "            "               # body / kv-loop / head-dim-chunk indents
     lo_qk, hi_qk = -(1 << ib_qk), (1 << ib_qk) - 1
     lo_pv, hi_pv = -(1 << ib_pv), (1 << ib_pv) - 1
@@ -233,15 +293,15 @@ def _gen_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
     qsc = _bfp_scale(tl.max(tl.abs(q), axis=1).to(tl.float32), {ib_qk})
     qI = (q / qsc[:, None] + tl.where(q >= 0, 0.5, -0.5)).to(tl.int32)
     qI = tl.minimum(tl.maximum(qI, {lo_qk}), {hi_qk})   # block-FP clamp [-2^ib,2^ib-1]
-{_emit_peel("q", "qI", w_qk, nD_qk, no_clamp, I)}'''
+{_emit_peel("q", "qI", w_qk, nD_qk, no_clamp, I, pack_dtype)}'''
         qk_body = f'''        k = tl.load(K + pid_z * skz + offn[:, None] * skn + offd[None, :] * skd,
                     mask=nmask[:, None] & dmask[None, :], other=0.0)
         ksc = _bfp_scale(tl.max(tl.abs(k), axis=1).to(tl.float32), {ib_qk})
         kI = (k / ksc[:, None] + tl.where(k >= 0, 0.5, -0.5)).to(tl.int32)
         kI = tl.minimum(tl.maximum(kI, {lo_qk}), {hi_qk})
-{_emit_peel("k", "kI", w_qk, nD_qk, no_clamp, L)}
+{_emit_peel("k", "kI", w_qk, nD_qk, no_clamp, L, pack_dtype)}
         cacc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
-{_emit_dots("cacc", plan_qk, "q", "k", True, L)}
+{_emit_dots("cacc", plan_qk, "q", "k", True, L, w_qk, pack_dtype)}
         qk = cacc * qsc[:, None] * ksc[None, :] * sm_scale'''
     else:
         qk_pre = ""
@@ -254,15 +314,15 @@ def _gen_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
             qsc = _bfp_scale(tl.max(tl.abs(qc), axis=1).to(tl.float32), {ib_qk})
             qI = (qc / qsc[:, None] + tl.where(qc >= 0, 0.5, -0.5)).to(tl.int32)
             qI = tl.minimum(tl.maximum(qI, {lo_qk}), {hi_qk})
-{_emit_peel("q", "qI", w_qk, nD_qk, no_clamp, L2)}
+{_emit_peel("q", "qI", w_qk, nD_qk, no_clamp, L2, pack_dtype)}
             kc = tl.load(K + pid_z * skz + offn[:, None] * skn + offc[None, :] * skd,
                          mask=nmask[:, None] & cmask[None, :], other=0.0)
             ksc = _bfp_scale(tl.max(tl.abs(kc), axis=1).to(tl.float32), {ib_qk})
             kI = (kc / ksc[:, None] + tl.where(kc >= 0, 0.5, -0.5)).to(tl.int32)
             kI = tl.minimum(tl.maximum(kI, {lo_qk}), {hi_qk})
-{_emit_peel("k", "kI", w_qk, nD_qk, no_clamp, L2)}
+{_emit_peel("k", "kI", w_qk, nD_qk, no_clamp, L2, pack_dtype)}
             cacc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
-{_emit_dots("cacc", plan_qk, "q", "k", True, L2)}
+{_emit_dots("cacc", plan_qk, "q", "k", True, L2, w_qk, pack_dtype)}
             qk += cacc * qsc[:, None] * ksc[None, :]              # per-chunk block-FP, accumulated
         qk = qk * sm_scale'''
 
@@ -275,17 +335,17 @@ def _gen_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
         l_i = l_i * alpha + tl.sum(p, axis=1)
         v = tl.load(V + pid_z * svz + offn[:, None] * svn + offd[None, :] * svd,
                     mask=nmask[:, None] & dmask[None, :], other=0.0)
-        p = p.to(tl.bfloat16)                     # P->bf16 for P@V (matches SDPA/flash-exact); l_i normalizer stays fp32
+        p = p.to(tl.bfloat16)                     # P->bf16 for P@V (models the real flash datapath; NOT a packing detail, so it stays bf16 whatever pack_dtype is); l_i normalizer stays fp32
         psc = _bfp_scale(tl.max(p, axis=1).to(tl.float32), {ib_pv})
         vsc = _bfp_scale(tl.max(tl.abs(v), axis=0).to(tl.float32), {ib_pv})
         pI = (p / psc[:, None] + 0.5).to(tl.int32)
         pI = tl.minimum(pI, {hi_pv})
         vI = (v / vsc[None, :] + tl.where(v >= 0, 0.5, -0.5)).to(tl.int32)
         vI = tl.minimum(tl.maximum(vI, {lo_pv}), {hi_pv})
-{_emit_peel("pp", "pI", w_pv, nD_pv, no_clamp, L)}
-{_emit_peel("vv", "vI", w_pv, nD_pv, no_clamp, L)}
+{_emit_peel("pp", "pI", w_pv, nD_pv, no_clamp, L, pack_dtype)}
+{_emit_peel("vv", "vI", w_pv, nD_pv, no_clamp, L, pack_dtype)}
         pv = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
-{_emit_dots("pv", plan_pv, "pp", "vv", False, L)}
+{_emit_dots("pv", plan_pv, "pp", "vv", False, L, w_pv, pack_dtype)}
         pv = pv * psc[:, None] * vsc[None, :]
         acc = acc * alpha[:, None] + pv
         m_i = m_new'''
@@ -332,8 +392,8 @@ def _flash_cg(
 _KERNEL_CACHE = {}
 
 
-def _get_kernel(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
-    key = (nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked)
+def _get_kernel(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked, pack_dtype="bf16"):
+    key = (nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked, pack_dtype)
     if key not in _KERNEL_CACHE:
         src = _gen_src(*key)
         fname = f"<flash_cg_{key}>"
@@ -352,10 +412,19 @@ def _flash_exact_fwd(
     sqz, sqn, sqd, skz, skn, skd, svz, svn, svd, soz, son, sod,
     HEAD_DIM: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr, GQA_G: tl.constexpr, KQ: tl.constexpr, HAS_KVLEN: tl.constexpr,
+    PV_SPLIT: tl.constexpr = False,
 ):
     """Plain bf16 flash attention (no ozaki) -- the flash-exact baseline the benches compare against.
     Same online-softmax / causal / GQA-fold structure as the generated ozaki kernel, so the two are
-    apples-to-apples; only the QK/PV dots differ (single bf16 dot vs digit-plane plan)."""
+    apples-to-apples; only the QK/PV dots differ (single bf16 dot vs digit-plane plan).
+
+    PV_SPLIT: carry P into P@V at ~16 mantissa bits via a hi/lo bf16 pair (two dots) instead of one
+    bf16 dot. The single cast is this path's DOMINANT error term (measured 1.52e-3 of a 2.24e-3 total
+    at decode N=2048, vs 2.7e-7 for everything the tiling/online-softmax does). vllm-flash-attn casts
+    P to bf16 too (a mantissa-bit sweep puts it in the same 8-bit-P class), so dropping the cast takes
+    this path OUT of that class rather than merely matching it: decode error falls to 1.640e-3, the
+    floor set by the bf16 output store alone. Enabled for decode only (small GQA-folded BLOCK_M),
+    where the extra dot rides along in a memory-bound kernel."""
     pid_m = tl.program_id(0); pid_z = tl.program_id(1)
     if HAS_KVLEN:                                     # per-batch valid kv length (vLLM padded decode)
         kvlen = tl.load(KVLEN + pid_z)
@@ -389,7 +458,14 @@ def _flash_exact_fwd(
         l_i = l_i * alpha + tl.sum(p, axis=1)
         v = tl.load(V + pid_z * svz + offn[:, None] * svn + offd[None, :] * svd,
                     mask=nmask[:, None] & dmask[None, :], other=0.0)
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        if PV_SPLIT:
+            # p_hi + p_lo reproduces p to ~2^-17 (p_hi is within a factor 2 of p, so the residual is
+            # exact in fp32 and lands in bf16's 8 bits again). Both dots accumulate in fp32.
+            p_hi = p.to(v.dtype)
+            p_lo = (p - p_hi.to(tl.float32)).to(v.dtype)
+            acc = acc * alpha[:, None] + tl.dot(p_hi, v) + tl.dot(p_lo, v)
+        else:
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
     acc = acc / l_i[:, None]
     tl.store(Out + pid_z * soz + offm[:, None] * son + offd[None, :] * sod,
@@ -398,7 +474,7 @@ def _flash_exact_fwd(
 
 def flash_oz1fp_cg(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scale=None, ozaki=True,
                    byte_split_style="all_signed_no_clamp", chunk_size=None, BLOCK_M=64, BLOCK_N=64,
-                   num_warps=4, num_stages=1, kv_lens=None):
+                   num_warps=4, num_stages=1, kv_lens=None, pv_split=None, pack_dtype="bf16"):
     """Code-generated Flash-Ozaki1_fp. q:[B,Hq,T,D]; k,v:[B,Hkv,N,D] bf16 (MHA Hq==Hkv; GQA Hq=Hkv*G
     folds the G group-heads into the query-row dim). nmp/w drive QK^T; nmp_pv/w_pv (default = nmp/w)
     drive P@V INDEPENDENTLY -- QK-nmp != PV-nmp is supported. Optimal pack plan + single-peel planes
@@ -412,7 +488,14 @@ def flash_oz1fp_cg(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scal
 
     kv_lens: optional int tensor [B] of the valid kv length per batch element. When given, kv positions
     >= kv_lens[b] are masked out (score -inf) -- for vLLM decode where K/V are gathered/padded to a
-    shared max length but each sequence attends only its own prefix. None => all N positions valid."""
+    shared max length but each sequence attends only its own prefix. None => all N positions valid.
+
+    pv_split (ozaki=False only): carry P into P@V as a hi/lo bf16 pair (~16 mantissa bits, two dots)
+    instead of one bf16 cast. **Default OFF** -- a mantissa-bit sweep showed vllm-flash-attn casts P
+    to bf16 as well, so enabling this would make the bf16 control structurally MORE accurate (1.64e-3
+    vs FA's 2.16e-3) than the kernel it is meant to stand in for. Keep it for studying the P term in
+    isolation. The ozaki path never splits either -- its digit-plane PV is bit-exact with production
+    `ozaki1_batched_gemm_fp` and must stay so."""
     nmp_pv = nmp if nmp_pv is None else nmp_pv
     w_pv = w if w_pv is None else w_pv
     no_clamp = 1 if byte_split_style == "all_signed_no_clamp" else 0
@@ -435,11 +518,17 @@ def flash_oz1fp_cg(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scal
     kz, vz = (t.reshape(B * Hkv, N, D).contiguous() for t in (k, v))
     BLOCK_M = max(16, min(BLOCK_M, triton.next_power_of_2(Qrows)))
     o = torch.empty_like(qz)
-    kern = _get_kernel(nmp, w, nmp_pv, w_pv, no_clamp, chunked) if ozaki else _flash_exact_fwd
+    kern = (_get_kernel(nmp, w, nmp_pv, w_pv, no_clamp, chunked, pack_dtype) if ozaki
+            else _flash_exact_fwd)
     has_kvlen = kv_lens is not None
     # expand per-batch [B] valid-length to [B*Hkv] so program pid_z (=(b,hkv)) indexes it directly.
     kvlen_z = (kv_lens.to(device=q.device, dtype=torch.int32).reshape(B).repeat_interleave(Hkv).contiguous()
                if has_kvlen else qz)          # dummy ptr when absent; HAS_KVLEN=False so never loaded
+
+    # OFF by default: vllm-flash-attn casts P to bf16 too, so splitting P would make this control
+    # structurally MORE accurate than the kernel it stands in for. Opt in only to study the P term.
+    pv_split = False if pv_split is None else pv_split
+    extra = {} if ozaki else {"PV_SPLIT": bool(pv_split)}
 
     def _launch(bm):
         kern[(triton.cdiv(Qrows, bm), B * Hkv)](
@@ -448,6 +537,7 @@ def flash_oz1fp_cg(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scal
             vz.stride(0), vz.stride(1), vz.stride(2), o.stride(0), o.stride(1), o.stride(2),
             HEAD_DIM=D, BLOCK_D=triton.next_power_of_2(D), BLOCK_M=bm, BLOCK_N=BLOCK_N,
             CAUSAL=causal, GQA_G=G, KQ=KQ, HAS_KVLEN=has_kvlen, num_warps=num_warps, num_stages=num_stages,
+            **extra,
         )
     _run_with_oom_retry(_launch, BLOCK_M)
     if G == 1:
@@ -456,7 +546,7 @@ def flash_oz1fp_cg(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scal
 
 
 # --- pre-encoded KV cache (the attention analog of weight_cache) -------------------------------
-def _gen_cached_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
+def _gen_cached_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked, pack_dtype="bf16"):
     """Codegen cached-KV flash kernel: same plan+peel as _gen_src, but K/V are LOADED from
     pre-encoded place-folded planes (encode_kv) instead of peeled inline -- so per-tile K/V amax +
     round + split + cast is skipped (decode's dominant cost). Q & P are still encoded inline (P is the
@@ -469,8 +559,8 @@ def _gen_cached_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
     nD_pv = oz1fp_params(nmp_pv, w_pv)[0]
     ib_qk = w_qk * nD_qk - 1
     ib_pv = w_pv * nD_pv - 1
-    plan_qk = pack_plan(nmp_qk, w_qk)
-    plan_pv = pack_plan(nmp_pv, w_pv)
+    plan_qk = pack_plan(nmp_qk, w_qk, pack_dtype)
+    plan_pv = pack_plan(nmp_pv, w_pv, pack_dtype)
     I, L, L2 = "    ", "        ", "            "
     lo_qk, hi_qk, hi_pv, lo_pv = -(1 << ib_qk), (1 << ib_qk) - 1, (1 << ib_pv) - 1, -(1 << ib_pv)
     # load names MUST match _super(prefix): _super("k")->kp{t}, _super("vv")->vvp{t} (it appends 'p').
@@ -485,11 +575,11 @@ def _gen_cached_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
     qsc = _bfp_scale(tl.max(tl.abs(q), axis=1).to(tl.float32), {ib_qk})
     qI = (q / qsc[:, None] + tl.where(q >= 0, 0.5, -0.5)).to(tl.int32)
     qI = tl.minimum(tl.maximum(qI, {lo_qk}), {hi_qk})
-{_emit_peel("q", "qI", w_qk, nD_qk, no_clamp, I)}'''
+{_emit_peel("q", "qI", w_qk, nD_qk, no_clamp, I, pack_dtype)}'''
         qk_body = f'''        ksc = tl.load(Ks + pid_z * sksz + offn * sksn, mask=nmask, other=0.0)
 {kload}
         cacc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
-{_emit_dots("cacc", plan_qk, "q", "k", True, L)}
+{_emit_dots("cacc", plan_qk, "q", "k", True, L, w_qk, pack_dtype)}
         qk = cacc * qsc[:, None] * ksc[None, :] * sm_scale'''
     else:
         kload = "\n".join(
@@ -505,11 +595,11 @@ def _gen_cached_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
             qsc = _bfp_scale(tl.max(tl.abs(qc), axis=1).to(tl.float32), {ib_qk})
             qI = (qc / qsc[:, None] + tl.where(qc >= 0, 0.5, -0.5)).to(tl.int32)
             qI = tl.minimum(tl.maximum(qI, {lo_qk}), {hi_qk})
-{_emit_peel("q", "qI", w_qk, nD_qk, no_clamp, L2)}
+{_emit_peel("q", "qI", w_qk, nD_qk, no_clamp, L2, pack_dtype)}
             ksc = tl.load(Ks + pid_z * sksz + (dc // KQ) * skscd + offn * sksn, mask=nmask, other=0.0)
 {kload}
             cacc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
-{_emit_dots("cacc", plan_qk, "q", "k", True, L2)}
+{_emit_dots("cacc", plan_qk, "q", "k", True, L2, w_qk, pack_dtype)}
             qk += cacc * qsc[:, None] * ksc[None, :]              # per-chunk cached K scale, accumulated
         qk = qk * sm_scale'''
 
@@ -525,10 +615,10 @@ def _gen_cached_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, chunked):
         psc = _bfp_scale(tl.max(p, axis=1).to(tl.float32), {ib_pv})
         pI = (p / psc[:, None] + 0.5).to(tl.int32)
         pI = tl.minimum(pI, {hi_pv})
-{_emit_peel("pp", "pI", w_pv, nD_pv, no_clamp, L)}
+{_emit_peel("pp", "pI", w_pv, nD_pv, no_clamp, L, pack_dtype)}
 {vload}
         pv = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
-{_emit_dots("pv", plan_pv, "pp", "vv", False, L)}
+{_emit_dots("pv", plan_pv, "pp", "vv", False, L, w_pv, pack_dtype)}
         pv = pv * psc[:, None] * vsc[None, :]
         acc = acc * alpha[:, None] + pv
         m_i = m_new'''
@@ -839,13 +929,14 @@ def flash_oz1fp_cg_cached(q, kv, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm
 # merges them by log-sum-exp. More concurrent programs -> higher occupancy -> the ALU overlaps the
 # idle memory pipe. chunk=32 only; each split is a whole number of BLOCK_N tiles so per-tile block-FP
 # is byte-for-byte the non-split encoding (result matches non-split to fp-accumulation order ~1e-6).
-def _gen_split_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp):
+def _gen_split_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, pack_dtype="bf16"):
+    assert_int32_peel_fits(nmp_qk, w_qk); assert_int32_peel_fits(nmp_pv, w_pv)
     nD_qk = oz1fp_params(nmp_qk, w_qk)[0]
     nD_pv = oz1fp_params(nmp_pv, w_pv)[0]
     ib_qk = w_qk * nD_qk - 1
     ib_pv = w_pv * nD_pv - 1
-    plan_qk = pack_plan(nmp_qk, w_qk)
-    plan_pv = pack_plan(nmp_pv, w_pv)
+    plan_qk = pack_plan(nmp_qk, w_qk, pack_dtype)
+    plan_pv = pack_plan(nmp_pv, w_pv, pack_dtype)
     L, L2 = "        ", "            "
     lo_qk, hi_qk = -(1 << ib_qk), (1 << ib_qk) - 1
     lo_pv, hi_pv = -(1 << ib_pv), (1 << ib_pv) - 1
@@ -858,15 +949,15 @@ def _gen_split_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp):
             qsc = _bfp_scale(tl.max(tl.abs(qc), axis=1).to(tl.float32), {ib_qk})
             qI = (qc / qsc[:, None] + tl.where(qc >= 0, 0.5, -0.5)).to(tl.int32)
             qI = tl.minimum(tl.maximum(qI, {lo_qk}), {hi_qk})
-{_emit_peel("q", "qI", w_qk, nD_qk, no_clamp, L2)}
+{_emit_peel("q", "qI", w_qk, nD_qk, no_clamp, L2, pack_dtype)}
             kc = tl.load(K + pid_z * skz + offn[:, None] * skn + offc[None, :] * skd,
                          mask=nmask[:, None] & cmask[None, :], other=0.0)
             ksc = _bfp_scale(tl.max(tl.abs(kc), axis=1).to(tl.float32), {ib_qk})
             kI = (kc / ksc[:, None] + tl.where(kc >= 0, 0.5, -0.5)).to(tl.int32)
             kI = tl.minimum(tl.maximum(kI, {lo_qk}), {hi_qk})
-{_emit_peel("k", "kI", w_qk, nD_qk, no_clamp, L2)}
+{_emit_peel("k", "kI", w_qk, nD_qk, no_clamp, L2, pack_dtype)}
             cacc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
-{_emit_dots("cacc", plan_qk, "q", "k", True, L2)}
+{_emit_dots("cacc", plan_qk, "q", "k", True, L2, w_qk, pack_dtype)}
             qk += cacc * qsc[:, None] * ksc[None, :]
         qk = qk * sm_scale'''
     tail = f'''        qk = tl.where(nmask[None, :], qk, -float("inf"))
@@ -885,10 +976,10 @@ def _gen_split_src(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp):
         pI = tl.minimum(pI, {hi_pv})
         vI = (v / vsc[None, :] + tl.where(v >= 0, 0.5, -0.5)).to(tl.int32)
         vI = tl.minimum(tl.maximum(vI, {lo_pv}), {hi_pv})
-{_emit_peel("pp", "pI", w_pv, nD_pv, no_clamp, L)}
-{_emit_peel("vv", "vI", w_pv, nD_pv, no_clamp, L)}
+{_emit_peel("pp", "pI", w_pv, nD_pv, no_clamp, L, pack_dtype)}
+{_emit_peel("vv", "vI", w_pv, nD_pv, no_clamp, L, pack_dtype)}
         pv = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
-{_emit_dots("pv", plan_pv, "pp", "vv", False, L)}
+{_emit_dots("pv", plan_pv, "pp", "vv", False, L, w_pv, pack_dtype)}
         pv = pv * psc[:, None] * vsc[None, :]
         acc = acc * alpha[:, None] + pv
         m_i = m_new'''
@@ -936,6 +1027,122 @@ def _flash_split(
 
 
 @triton.jit
+def _flash_exact_split_fwd(
+    Q, K, V, Mp, Lp, Accp, sm_scale, Z, N_CTX, Q_LEN, Q_OFF, KVLEN,
+    sqz, sqn, sqd, skz, skn, skd, svz, svn, svd,
+    smz, sms, smm, slz, sls, slm, saz, sas, sam, sad,
+    HEAD_DIM: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    CAUSAL: tl.constexpr, GQA_G: tl.constexpr, KQ: tl.constexpr, HAS_KVLEN: tl.constexpr,
+    N_SPLITS: tl.constexpr, PV_SPLIT: tl.constexpr = False,
+):
+    """Plain bf16 twin of the generated `_flash_split`: flash-decoding partials (fp32 m/l/acc per kv
+    slice) merged by `_flash_combine`'s fp32 LSE sum. This is vllm-flash-attn's decode structure --
+    measured: FA at num_splits=1 lands on 2.234e-3 (== our single-pass path) and its auto choice of
+    ~8 splits on 2.163e-3, so the split count, not the dot or the softmax, was the whole difference."""
+    pid_m = tl.program_id(0); pid_z = tl.program_id(1); pid_s = tl.program_id(2)
+    if HAS_KVLEN:
+        kvlen = tl.load(KVLEN + pid_z)
+    else:
+        kvlen = N_CTX
+    offm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offd = tl.arange(0, BLOCK_D)
+    dmask = offd < HEAD_DIM
+    mmask = offm < Q_LEN
+    q = tl.load(Q + pid_z * sqz + offm[:, None] * sqn + offd[None, :] * sqd,
+                mask=mmask[:, None] & dmask[None, :], other=0.0)
+    if CAUSAL:
+        last_m = tl.minimum((pid_m + 1) * BLOCK_M, Q_LEN) - 1
+        n_end = tl.minimum(Q_OFF + last_m // GQA_G + 1, kvlen)
+    else:
+        n_end = kvlen
+    sblk = tl.cdiv(tl.cdiv(n_end, BLOCK_N), N_SPLITS)         # kv tiles per split
+    kv_start = pid_s * sblk * BLOCK_N
+    kv_end = tl.minimum((pid_s + 1) * sblk * BLOCK_N, n_end)  # empty slice keeps the (-inf, 0, 0) partial
+    m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
+    for n0 in range(kv_start, kv_end, BLOCK_N):
+        offn = n0 + tl.arange(0, BLOCK_N)
+        nmask = offn < kvlen
+        k = tl.load(K + pid_z * skz + offn[:, None] * skn + offd[None, :] * skd,
+                    mask=nmask[:, None] & dmask[None, :], other=0.0)
+        qk = tl.dot(q, tl.trans(k)) * sm_scale
+        qk = tl.where(nmask[None, :], qk, -float("inf"))
+        if CAUSAL:
+            qk = tl.where((Q_OFF + offm // GQA_G)[:, None] >= offn[None, :], qk, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        v = tl.load(V + pid_z * svz + offn[:, None] * svn + offd[None, :] * svd,
+                    mask=nmask[:, None] & dmask[None, :], other=0.0)
+        if PV_SPLIT:
+            p_hi = p.to(v.dtype)
+            p_lo = (p - p_hi.to(tl.float32)).to(v.dtype)
+            acc = acc * alpha[:, None] + tl.dot(p_hi, v) + tl.dot(p_lo, v)
+        else:
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        m_i = m_new
+    tl.store(Mp + pid_z * smz + pid_s * sms + offm * smm, m_i, mask=mmask)
+    tl.store(Lp + pid_z * slz + pid_s * sls + offm * slm, l_i, mask=mmask)
+    tl.store(Accp + pid_z * saz + pid_s * sas + offm[:, None] * sam + offd[None, :] * sad,
+             acc, mask=mmask[:, None] & dmask[None, :])
+
+
+def decode_num_splits(zc, n_tiles, n_sm=None):
+    """THE decode split count -- used by BOTH the ozaki path and the bf16 exact control, on purpose.
+
+    Sizing is occupancy-driven (the ozaki kernel is integer-ALU-bound at decode and its natural grid is
+    only zc = B*Hkv, see Part F.5: up to 3.8x from splitting). The exact control deliberately reuses it
+    rather than vllm-flash-attn's own count, because the split count is not numerically neutral: each
+    split re-normalises by its own max, so its argmax lands on p = exp(0) = 1, which is exactly
+    representable in bf16 (eps = 0) AND is the heaviest term in that split. More splits => more
+    zero-error anchors => lower error (measured w4 nmp10: 2.267e-3 at 1 split, 2.093e-3 at 32).
+
+    A control that split differently from the run it controls would carry a different amount of that
+    artefact -- which is exactly what happened before: the ozaki runs split 32-way while the bf16
+    control ran single-pass, leaving the CONTROL less accurate than the arm it was controlling.
+    Sharing this function makes the two structurally identical, so an ozaki-vs-control difference is
+    the digit-plane GEMM and nothing else.
+
+    `fa_num_splits` is the vllm-flash-attn-matched alternative, kept for measuring against FA."""
+    if n_sm is None:
+        n_sm = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return max(1, min(-(-16 * n_sm // max(zc, 1)), n_tiles, 32))
+
+
+def fa_num_splits(zc, n_tiles, n_sm=None):
+    """flash-decoding split count sized to land on vllm-flash-attn's own choice. NOT the serving
+    default -- see `decode_num_splits` for why both paths share the occupancy heuristic instead.
+    Use this when the question is "how do we compare against FA", not "isolate ozaki".
+
+    FA2 picks num_splits by wave-quantisation over the SMs. Its auto values were read back by
+    bitwise-matching FA(auto) against FA(num_splits=s) on an A6000 (84 SMs, Hkv=2, decode) -- note
+    several requested s collapse onto the same partition, so these are the canonical (lowest) members:
+
+        zc = B*Hkv      2      4      8     16     32    64
+        N=512           4      4      4      4      4     1
+        N=2048         16     16     16      8      4     2
+        N=4368         35     35     18      9      5     5
+
+    Two rules reproduce that: (a) never finer than ~128 keys per split -- the small-zc column is
+    exactly ceil(N/128); (b) otherwise ~1.5 waves of split-blocks over the SMs. This returns
+    min(ceil(n_tiles/4), ceil(1.5*SM/zc)) with BLOCK_N=32, i.e. exactly those two rules:
+
+        this fn      4/16/35   4/16/32   4/16/16   4/8/8   4/4/4   2/2/2
+
+    Exactness is not the point and is not attainable from outside a compiled kernel: the error moves
+    only 3.2% from 1 to 8 splits and ~1% from 8 to 16, so a few splits either way is well inside the
+    level being matched. What matters is running the SAME structure (per-split fp32 m/l/acc + fp32 LSE
+    combine) at the SAME order of split count, so the control is neither above nor below FA."""
+    if n_sm is None:
+        n_sm = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    coarse = max(1, -(-n_tiles // 4))                 # >= ~128 keys per split (FA's floor)
+    waves = max(1, -(-3 * n_sm // (2 * max(zc, 1))))  # ~1.5 waves of split-blocks over the SMs
+    return max(1, min(n_tiles, coarse, waves))
+
+
+@triton.jit
 def _flash_combine(
     Mp, Lp, Accp, Out, Z, Q_LEN,
     smz, sms, smm, slz, sls, slm, saz, sas, sam, sad, soz, son, sod,
@@ -970,8 +1177,8 @@ def _flash_combine(
 _SPLIT_KERNEL_CACHE = {}
 
 
-def _get_split_kernel(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp):
-    key = (nmp_qk, w_qk, nmp_pv, w_pv, no_clamp)
+def _get_split_kernel(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, pack_dtype="bf16"):
+    key = (nmp_qk, w_qk, nmp_pv, w_pv, no_clamp, pack_dtype)
     if key not in _SPLIT_KERNEL_CACHE:
         src = _gen_split_src(*key)
         fname = f"<flash_split_{key}>"
@@ -984,12 +1191,18 @@ def _get_split_kernel(nmp_qk, w_qk, nmp_pv, w_pv, no_clamp):
 
 def flash_oz1fp_cg_splitkv(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True, sm_scale=None,
                            byte_split_style="all_signed_no_clamp", chunk_size=32, n_splits=8,
-                           BLOCK_M=64, num_warps=4, num_stages=1, kv_lens=None):
+                           BLOCK_M=64, num_warps=4, num_stages=1, kv_lens=None, ozaki=True,
+                           pv_split=False, pack_dtype="bf16"):
     """Split-KV / flash-decoding variant of flash_oz1fp_cg (non-cached, chunk=32). Partitions the kv
     loop into n_splits program-z slices to raise occupancy at decode (small B*Hkv grid), then merges
     the partials by log-sum-exp. Same numerics as flash_oz1fp_cg to fp-accumulation order (each split
     is whole BLOCK_N tiles -> identical per-tile block-FP). Intended for decode (q_len small); prefill
-    already has enough parallelism. Falls back to n_splits=1 == the plain path (one slice)."""
+    already has enough parallelism. Falls back to n_splits=1 == the plain path (one slice).
+
+    ozaki=False runs `_flash_exact_split_fwd`, the plain bf16 twin. For the exact path this is not an
+    occupancy trick but a NUMERICAL match: vllm-flash-attn's decode is flash-decoding, and its split
+    count is the entire reason it sat ~4.7% closer to fp64 than our single-pass exact kernel. Size
+    n_splits with `fa_num_splits` to land on FA's level."""
     nmp_pv = nmp if nmp_pv is None else nmp_pv
     w_pv = w if w_pv is None else w_pv
     no_clamp = 1 if byte_split_style == "all_signed_no_clamp" else 0
@@ -1000,7 +1213,7 @@ def flash_oz1fp_cg_splitkv(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True,
     if sm_scale is None:
         sm_scale = 1.0 / (D ** 0.5)
     KQ = triton.next_power_of_2(min(chunk_size, D))
-    assert KQ < D, "split-KV requires chunk_size < head_dim (the chunked path)"
+    assert KQ < D or not ozaki, "split-KV requires chunk_size < head_dim (the chunked path)"
     BLOCK_N = triton.next_power_of_2(chunk_size)
     Qrows = T * G
     qz = (q.reshape(B * Hkv, T, D) if G == 1 else
@@ -1013,10 +1226,12 @@ def flash_oz1fp_cg_splitkv(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True,
     Lp = torch.zeros((Zc, n_splits, Qrows), device=q.device, dtype=torch.float32)
     Accp = torch.zeros((Zc, n_splits, Qrows, D), device=q.device, dtype=torch.float32)
     o = torch.empty_like(qz)
-    kern = _get_split_kernel(nmp, w, nmp_pv, w_pv, no_clamp)
+    kern = (_get_split_kernel(nmp, w, nmp_pv, w_pv, no_clamp, pack_dtype) if ozaki
+            else _flash_exact_split_fwd)
     has_kvlen = kv_lens is not None
     kvlen_z = (kv_lens.to(device=q.device, dtype=torch.int32).reshape(B).repeat_interleave(Hkv).contiguous()
                if has_kvlen else qz)
+    extra = {} if ozaki else {"PV_SPLIT": bool(pv_split)}
     kern[(triton.cdiv(Qrows, BLOCK_M), Zc, n_splits)](
         qz, kz, vz, Mp, Lp, Accp, sm_scale, Zc, N, Qrows, N - T, kvlen_z,
         qz.stride(0), qz.stride(1), qz.stride(2), kz.stride(0), kz.stride(1), kz.stride(2),
@@ -1025,7 +1240,7 @@ def flash_oz1fp_cg_splitkv(q, k, v, nmp, w, nmp_pv=None, w_pv=None, causal=True,
         Accp.stride(0), Accp.stride(1), Accp.stride(2), Accp.stride(3),
         HEAD_DIM=D, BLOCK_D=BD, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
         CAUSAL=causal, GQA_G=G, KQ=KQ, HAS_KVLEN=has_kvlen, N_SPLITS=n_splits,
-        num_warps=num_warps, num_stages=num_stages,
+        num_warps=num_warps, num_stages=num_stages, **extra,
     )
     _flash_combine[(triton.cdiv(Qrows, BLOCK_M), Zc)](
         Mp, Lp, Accp, o, Zc, Qrows,

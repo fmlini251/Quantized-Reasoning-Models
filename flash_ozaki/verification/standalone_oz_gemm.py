@@ -7,17 +7,19 @@ to production and the residual is purely fp32 accumulation order."""
 import sys, linecache
 import torch, triton, triton.language as tl
 sys.path.insert(0, "/home/howonlee/Quantized-Reasoning-Models")
-from flash_ozaki.flash_oz1fp_codegen import (pack_plan, _emit_peel, _super, _emit_dots, _bfp_scale,
+from flash_ozaki.flash_oz1fp_codegen import (assert_int32_peel_fits,
+                                             pack_plan, _emit_peel, _super, _emit_dots, _bfp_scale,
                                              _bfp_scale_torch, _digit_planes)
 from flash_ozaki.oz1fp_triton import oz1fp_params
 # _bfp_scale_torch / _digit_planes live in flash_oz1fp_codegen (single source); re-exported here so
 # verify_faithfulness.py's `from standalone_oz_gemm import _bfp_scale_torch` keeps working.
 
 
-def _gen_gemm_src(nmp, w, no_clamp, cached):
+def _gen_gemm_src(nmp, w, no_clamp, cached, pack_dtype="bf16"):
+    assert_int32_peel_fits(nmp, w)
     nD = oz1fp_params(nmp, w)[0]
     ib = w * nD - 1                                          # production int_bits = w*nD-1
-    plan = pack_plan(nmp, w)
+    plan = pack_plan(nmp, w, pack_dtype)
     L = "        "
     # B operand: cached -> load nD pre-encoded place-folded planes Bp[t]; else encode inline.
     if cached:
@@ -33,7 +35,7 @@ def _gen_gemm_src(nmp, w, no_clamp, cached):
                  f"{L}sB = _bfp_scale(tl.max(tl.abs(b), axis=0).to(tl.float32), {ib})\n"
                  f"{L}bI = (b / sB[None,:] + tl.where(b>=0, 0.5, -0.5)).to(tl.int32)\n"
                  f"{L}bI = tl.minimum(tl.maximum(bI, {-(1<<ib)}), {(1<<ib)-1})\n"
-                 + _emit_peel("bp", "bI", w, nD, no_clamp, L))
+                 + _emit_peel("bp", "bI", w, nD, no_clamp, L, pack_dtype))
         bargs = "B, "
         bstrides = "sbz, sbk, sbn, "
         bscale = ""
@@ -52,11 +54,11 @@ def _gemm_cg(A, {bargs}C, M, N, K,
         sA = _bfp_scale(tl.max(tl.abs(a), axis=1).to(tl.float32), {ib})
         aI = (a / sA[:,None] + tl.where(a>=0, 0.5, -0.5)).to(tl.int32)
         aI = tl.minimum(tl.maximum(aI, {-(1<<ib)}), {(1<<ib)-1})
-{_emit_peel("ap", "aI", w, nD, no_clamp, L)}
+{_emit_peel("ap", "aI", w, nD, no_clamp, L, pack_dtype)}
 {bscale}
 {bload}
         cacc = tl.zeros([BM, BN], tl.float32)
-{_emit_dots("cacc", plan, "ap", "bp", False, L)}
+{_emit_dots("cacc", plan, "ap", "bp", False, L, w, pack_dtype)}
         acc += cacc * sA[:,None] * sB[None,:]
     tl.store(C + pid_z*scz + offm[:,None]*scm + offn[None,:]*scn, acc, mask=mm_[:,None] & nm[None,:])
 '''
@@ -66,8 +68,8 @@ def _gemm_cg(A, {bargs}C, M, N, K,
 _CACHE = {}
 
 
-def _get(nmp, w, no_clamp, cached):
-    key = (nmp, w, no_clamp, cached)
+def _get(nmp, w, no_clamp, cached, pack_dtype="bf16"):
+    key = (nmp, w, no_clamp, cached, pack_dtype)
     if key not in _CACHE:
         src = _gen_gemm_src(*key); fn = f"<gemm_cg_{key}>"
         linecache.cache[fn] = (len(src), None, src.splitlines(keepends=True), fn)
@@ -96,7 +98,7 @@ def encode_B(B, nmp, w, chunk, no_clamp):
 
 
 def oz1fp_gemm_cg(A, B, nmp, w, chunk=None, byte_split_style="all_signed_no_clamp",
-                  b_cache=None, BM=64, BN=64, num_warps=4, num_stages=2):
+                  b_cache=None, BM=64, BN=64, num_warps=4, num_stages=2, pack_dtype="bf16"):
     """A:[Z,M,K] @ B:[Z,K,N] -> [Z,M,N] fp32, ozaki1_fp via codegen plan+peel. b_cache=encode_B(...)
     for the cached path (B pre-encoded, like weight_cache)."""
     Z, M, K = A.shape
@@ -106,7 +108,7 @@ def oz1fp_gemm_cg(A, B, nmp, w, chunk=None, byte_split_style="all_signed_no_clam
     cached = b_cache is not None
     C = torch.empty(Z, M, N, device=A.device, dtype=torch.float32)
     grid = (triton.cdiv(M, BM), triton.cdiv(N, BN), Z)
-    kern = _get(nmp, w, no_clamp, cached)
+    kern = _get(nmp, w, no_clamp, cached, pack_dtype)
     if cached:
         Bp, Bs = b_cache
         kern[grid](A, Bp, Bs, C, M, N, K,
