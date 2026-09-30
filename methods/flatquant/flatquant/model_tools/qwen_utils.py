@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from ..quant_utils import ActivationQuantizer
+from ..fmt_bridge import role_fmt
 from ..utils import skip_initialization
 from ..function_utils import get_init_scale, get_decompose_dim
 from ..trans_utils import SVDSingleTransMatrix, SVDDecomposeTransMatrix
@@ -22,7 +23,7 @@ class FlatQuantQwen2MLP(torch.nn.Module):
         self.hidden_size = module.hidden_size
         self.intermediate_size = module.intermediate_size
         self.act_fn = module.act_fn
-        self.up_gate_quant = ActivationQuantizer(bits=args.a_bits, sym=not(args.a_asym), lac=args.lac)
+        self.up_gate_quant = ActivationQuantizer(bits=args.a_bits, sym=not(args.a_asym), lac=args.lac, fmt_cfg=role_fmt(args, "a"))
         self.up_proj = FlatQuantizedLinear(args, module.up_proj, act_quantizer=self.up_gate_quant)
         self.gate_proj = FlatQuantizedLinear(args, module.gate_proj, act_quantizer=self.up_gate_quant)
         self.down_proj = FlatQuantizedLinear(args, module.down_proj, tp=True)
@@ -130,7 +131,7 @@ class FlatQuantQwen2Attention(Qwen2Attention):
         super().__init__(module.config, module.layer_idx)
         self.args = args
         
-        self.qkv_quant = ActivationQuantizer(bits=args.a_bits, sym=not(args.a_asym), lac=args.lac)
+        self.qkv_quant = ActivationQuantizer(bits=args.a_bits, sym=not(args.a_asym), lac=args.lac, fmt_cfg=role_fmt(args, "a"))
         self.q_proj = FlatQuantizedLinear(args, module.q_proj, act_quantizer=self.qkv_quant)
         self.k_proj = FlatQuantizedLinear(args, module.k_proj, act_quantizer=self.qkv_quant)
         self.v_proj = FlatQuantizedLinear(args, module.v_proj, act_quantizer=self.qkv_quant)
@@ -139,13 +140,13 @@ class FlatQuantQwen2Attention(Qwen2Attention):
 
         if args.q_bits < 16:
             self.q_cache_quantizer = ActivationQuantizer(bits=args.q_bits, \
-                                        sym=not(args.q_asym), lac=args.lac, groupsize=-1, )
+                                        sym=not(args.q_asym), lac=args.lac, groupsize=-1, fmt_cfg=role_fmt(args, "q"))
         if args.k_bits < 16:
             self.k_cache_quantizer = ActivationQuantizer(bits=args.k_bits, \
-                                        sym=not(args.k_asym), lac=args.lac, groupsize=-1, )
+                                        sym=not(args.k_asym), lac=args.lac, groupsize=-1, fmt_cfg=role_fmt(args, "k"))
         if args.v_bits < 16:
             self.v_cache_quantizer = ActivationQuantizer(bits=args.v_bits, \
-                                        sym=not(args.v_asym), lac=args.lac, groupsize=-1, )
+                                        sym=not(args.v_asym), lac=args.lac, groupsize=-1, fmt_cfg=role_fmt(args, "v"))
 
         self._ori_mode = False
         self._eval_mode = False

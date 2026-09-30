@@ -45,6 +45,13 @@ def main():
             flat_utils.save_flat_matrices(args, model)
         flat_utils.reparameterize_model(model)
         logger.info("Finished reparameterize model.")
+        # E1-0: persist the per-(layer,op,role) formats frozen by the calibration observe pass
+        if getattr(args, "fmt_resolved", None):
+            import json as _json
+            with open(os.path.join(args.exp_dir, "fmt_resolved_map.json"), "w") as _f:
+                _json.dump(args.fmt_resolved, _f, indent=2, sort_keys=True)
+            logger.info("Saved %d frozen per-site formats to fmt_resolved_map.json"
+                        % len(args.fmt_resolved))
 
     if args.w_bits < 16:
         save_dict = {}
@@ -92,7 +99,11 @@ def main():
             "v_groupsize": args.v_groupsize,
             "lwc": args.lwc,
             "lac": args.lac,
-            "direct_inv": args.direct_inv
+            "direct_inv": args.direct_inv,
+            # W14: per-role fixed fmt_lib grids (inference-side reconstruction must replay these)
+            "fmt_config": {r: c.fmt_id for r, c in getattr(args, "fmt_cfg", {}).items()} or None,
+            # E1-0: per-(layer,op,role) formats frozen from calibration (site_key -> fmt_id)
+            "fmt_resolved": getattr(args, "fmt_resolved", {}) or None,
         }
         model.config.save_pretrained(args.save_qmodel_path)
         print(f"Model saved at {args.save_qmodel_path}.")

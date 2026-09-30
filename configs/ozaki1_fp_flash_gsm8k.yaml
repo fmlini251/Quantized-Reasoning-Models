@@ -12,7 +12,7 @@ model: ./modelzoo/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
 dataset: GSM8K
 
 # --- Ozaki emulation: attention QK^T/PV through the flash_ozaki Triton kernel ---
-ozaki_placement: attn_only     # attention QK^T/PV via ozaki; linear stays native bf16 (stock Qwen2).
+ozaki_placement: full     # attention QK^T/PV via ozaki; linear stays native bf16 (stock Qwen2).
 #                              #   use `full` for linear ozaki too -- then byte_split_style below also
 #                              #   applies to the linears (must stay all_signed_no_clamp for flash).
 rslt_type: ozaki1_fp           # REQUIRED for flash (bf16 block-FP datapath; ozaki2_fp/RNS stays eager).

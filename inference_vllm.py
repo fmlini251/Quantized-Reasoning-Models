@@ -72,6 +72,13 @@ def parser_gen():
                              'path. ozaki1_fp only (else falls back to eager). Same ozaki1_fp math, '
                              'much faster; output differs from eager by ~e-3 (bf16/P-encode granularity). '
                              'DEFAULT ON; pass --no-ozaki_flash to use the eager batched_gemm path.')
+    parser.add_argument('--ozaki_flash_exact', action=argparse.BooleanOptionalAction, default=False,
+                        help='For full/attn_only + --ozaki_flash: run the flash kernel in its PLAIN '
+                             'bf16 path (flash_oz1fp_cg ozaki=False, _flash_exact_fwd) instead of the '
+                             'ozaki digit-plane GEMM. A triton-flash-bf16 BASELINE: identical online-'
+                             'softmax/causal/GQA-fold + kv-tiling as the ozaki flash, differing ONLY in '
+                             'the QK/PV dot (bf16 vs digit-plane) -- isolates the pure ozaki-quant effect. '
+                             'Pair with --ozaki_placement attn_only to keep linears native bf16 too.')
     parser.add_argument('--rslt_type', type=str, default='ozaki1_fp',
                         choices=['ozaki1', 'ozaki1_fp', 'ozaki2', 'ozaki2_fp'],
                         help='Ozaki GEMM type (emulation name). ozaki1 / ozaki1_fp: block-FP '
@@ -80,11 +87,26 @@ def parser_gen():
                              'byte-plane emulation. ozaki2_fp is the validated path.')
     parser.add_argument('--nmp', type=int, default=6,
                         help='Ozaki-1 block-FP polynomial GEMM count (ozaki1 / ozaki1_fp).')
-    parser.add_argument('--gemm_bits', type=int, default=8, choices=[2, 4, 8],
+    parser.add_argument('--gemm_bits', type=int, default=8, choices=[2, 3, 4, 5, 6, 7, 8],
                         help='Ozaki-1 GEMM unit bit-width w (int_bits = w*nD-1). Default 8 = int8 '
-                             'byte-split / native fold. w=2/4 use the w-bit paths and REQUIRE '
+                             'byte-split / native fold. w!=8 uses the w-bit paths and REQUIRES '
                              'rslt_type ozaki1 / ozaki1_fp; with ozaki1 (int8 reference) w!=8 has '
-                             'no weight_cache, so set --weight_cache off. (ozaki2 ignores w.)')
+                             'no weight_cache, so set --weight_cache off. (ozaki2 ignores w.) '
+                             'Production accepts 2..8; the flash kernel is bit-faithful across that '
+                             'range (verified w=4/5/8 vs ozaki1_batched_gemm_fp). NOTE w only divides '
+                             '8 for w in {2,4,8}: the bf16 super-digit span is g=8//w, so w=3/5/6/7 '
+                             'emulate at g=1, i.e. ONE bf16 dot per digit pair (nmp dots, no packing) '
+                             '-- correct, just more emulation work per unit of accuracy.')
+    parser.add_argument('--pack_dtype', type=str, default='bf16', choices=['bf16', 'fp16'],
+                        help='Float type the flash_ozaki Triton kernel packs digit super-digits into. '
+                             'bf16 (default, and what production uses) has 8 significand bits -> span '
+                             'g=8//w; fp16 has 11 -> g=11//w, which only helps the widths that do not '
+                             'divide 8 (w=5: g 1->2, 4x fewer dots at nmp 4/16; w=3: 2->3). At w=2/4/8 '
+                             'g is unchanged and the output is BIT-IDENTICAL to bf16, so fp16 buys '
+                             'nothing there. fp16 also switches to production\'s relative-place + '
+                             'external place_exp convention (fp16 caps at 65504, so an absolute-place '
+                             'plane would overflow at int_bits>=16). Attention only -- linear layers '
+                             'run production, which is bf16-packed.')
     parser.add_argument('--byte_split_style', type=str, default='all_signed_clamp_pos',
                         choices=['all_signed_clamp_pos', 'all_signed_clamp', 'all_signed_no_clamp'],
                         help='Ozaki-1 integer digit-split (chunk) method: all_signed_clamp_pos '
@@ -144,6 +166,14 @@ def parser_gen():
                              'defaults to 2048 for any Ozaki placement (chunked prefill enabled).')
     parser.add_argument('--max_num_seqs', type=int, default=None,
                         help='Cap concurrent sequences (bounds the decode-batch Ozaki memory).')
+    parser.add_argument('--enable_chunked_prefill', action=argparse.BooleanOptionalAction, default=None,
+                        help='Chunked prefill. Default None = ON for any Ozaki placement, OFF for the '
+                             'native bf16 run. That default makes a native-vs-Ozaki comparison NOT a '
+                             'pure kernel comparison: together with the Ozaki-only max_num_seqs=48 / '
+                             'max_num_batched_tokens=2048 it changes the decode batch, hence the linear '
+                             'GEMM shapes (bf16 reduction order) and, on the flash path, the split-KV '
+                             'count. Set it explicitly (plus --max_num_seqs/--max_num_batched_tokens) '
+                             'to run a native baseline under the SAME scheduler as the Ozaki runs.')
     # YAML base config + CLI override (CLI > YAML > default), mirroring evaluate_ppl.py.
     from emulation.llm.config import apply_yaml_config
     args = apply_yaml_config(parser)
@@ -311,6 +341,8 @@ def main(args):
             max_num_batched_tokens = 2048
         if use_ozaki_attn and max_num_seqs is None:
             max_num_seqs = 48  # bound the decode pad-to-max attention gather at long context
+    if args.enable_chunked_prefill is not None:      # explicit override, for matched-scheduler baselines
+        enable_chunked_prefill = args.enable_chunked_prefill
         # ozaki2_fp place-value combine precision. DEFAULT fp32 accumulation (faster; closer to
         # real fixed/float accumulators); --combine_fp64 opts into the fp64 ppl baseline. Set
         # before the engine builds so spawned TP workers inherit it. Read by
@@ -399,7 +431,9 @@ def main(args):
                                         shift_bits=args.shift_bits, M_frac_bits=args.M_frac_bits,
                                         gemm_bits=args.gemm_bits,
                                         byte_split_style=args.byte_split_style,
+                                        pack_dtype=args.pack_dtype,
                                         flash=args.ozaki_flash,
+                                        flash_exact=args.ozaki_flash_exact,
                                         nmp_overrides=args.nmp_overrides,
                                         kv_cache_prefill=args.kv_cache_prefill)
 

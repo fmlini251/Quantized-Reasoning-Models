@@ -40,9 +40,17 @@ def make_run_tag(args):
     # Hash the config that actually affects THIS run. Always drop run-control / derived / perf
     # fields; additionally drop Ozaki params that don't apply (all of them when ozaki is off,
     # the other scheme's params when on) so numerically-identical runs share one dir.
+    # NOTE: the scheduler knobs below are excluded to keep run dirs stable, but they are NOT
+    # numerically neutral -- they change the decode batch, hence linear-GEMM shapes (bf16 reduction
+    # order) and the flash split-KV count. Two runs differing only in these land in the SAME dir, so
+    # give a matched-scheduler baseline an explicit --output_dir instead of relying on the hash.
     exclude = {"config", "output_dir", "output_path", "model_name", "tensor_parallel_size",
                "overwrite", "debug", "dataset", "gpu_memory_utilization",
-               "max_num_batched_tokens", "max_num_seqs"}
+               "max_num_batched_tokens", "max_num_seqs", "enable_chunked_prefill"}
+    # pack_dtype only exists from 2026-08; excluding it at its default keeps every pre-existing run
+    # dir's hash intact, while an fp16 run still lands in its own dir (it can change results at w=5).
+    if a.get("pack_dtype", "bf16") == "bf16":
+        exclude |= {"pack_dtype"}
     ozaki1_only = {"nmp", "nmp_overrides", "gemm_bits", "byte_split_style"}
     ozaki2_only = {"s", "scale_method", "shift_bits", "M_frac_bits", "combine_fp64", "s_overrides"}
     if a["ozaki_placement"] is None:

@@ -1,0 +1,27 @@
+# CONTROL: w=8 nmp=1 FULL on MATH-500, CURRENT code (no_clamp + flash).
+#
+# Purpose: the old backup run (982b88b6, eager, pre-gemm_bits, default clamp_pos) gave 0.508 for
+# w8-nmp1-full. But isolated per-GEMM relerr shows w8-nmp1 (int_bits=7, 1.28e-2) == w4-nmp4 (1.28e-2),
+# and w4-nmp4-full = 0.930. So the "true" w8-nmp1-full should be ~0.93; 0.508 looks like an artifact of
+# that old eager/native-fold run. This re-runs w8-nmp1-full on current code to confirm.
+#
+# Run: CUDA_VISIBLE_DEVICES=2,3 conda run -n quantized-reasoning-models \
+#          python inference_vllm.py --config configs/w8_nmp1_full_math500.yaml
+
+model: ./modelzoo/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
+dataset: MATH-500
+
+ozaki_placement: full            # linear + attention both ozaki (matches 982b88b6 / 82b22374)
+rslt_type: ozaki1_fp
+ozaki_flash: true                # flash path (matches the w4-nmp3=0.894 run 82b22374)
+byte_split_style: all_signed_no_clamp
+gemm_bits: 8                     # w = 8
+nmp: 1                           # nD=1, int_bits = 8*1-1 = 7  (== w4 nmp4)
+k: 32
+weight_cache: true
+
+temperature: 0.6
+top_p: 0.95
+seed: 42
+max_new_tokens: 32768
+max_model_length: 32768

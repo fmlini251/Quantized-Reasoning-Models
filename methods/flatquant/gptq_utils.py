@@ -7,6 +7,27 @@ import logging
 
 from .flatquant.utils import cleanup_memory
 from .flatquant.quant_utils import WeightQuantizer
+from .flatquant.fmt_bridge import role_fmt, site_fmt, fmt_lib
+
+
+def _w_site_key(i, name):
+    """Weight-quantizer site key matching the one the calibration freeze pass wrote
+    (train_utils.start_observe_layer): 'model.layers.{i}.<proj>.weight_quantizer'.
+    find_qlayers names the inner nn.Linear ('self_attn.q_proj.linear')."""
+    base = name[:-len(".linear")] if name.endswith(".linear") else name
+    return f"model.layers.{i}.{base}.weight_quantizer"
+
+
+def _fmt_w_groupsize(fmt_w, default_groupsize):
+    """W15: with a fmt weight format, GPTQ's group MUST equal the fmt block so that
+    find_params(group slice) yields a single-block plan (the column loop then quantizes
+    against frozen per-row scales -- same semantics as the uniform-INT group path).
+    block_size=-1 formats (int4_pc) keep the caller's groupsize. fmt_w is the per-site
+    resolved QuantConfig (E1-0), or None for the uniform path."""
+    if fmt_w is None:
+        return default_groupsize
+    blk = fmt_lib.resolve(fmt_w).block_size
+    return blk if blk != -1 else default_groupsize
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -250,7 +271,8 @@ def gptq_fwrd(model, dataloader, dev, args):
                 gptq[name] = GPTQ(subset[name])
                 gptq[name].quantizer = WeightQuantizer()
                 gptq[name].quantizer.configure(
-                    layer_weight_bits, groupsize=-1, sym=layer_weight_sym, mse=args.gptq_mse
+                    layer_weight_bits, groupsize=-1, sym=layer_weight_sym, mse=args.gptq_mse,
+                    fmt_cfg=site_fmt(args, _w_site_key(i, name), "w")
                 )
 
             def add_batch(name):
@@ -274,7 +296,8 @@ def gptq_fwrd(model, dataloader, dev, args):
                     groupsize = subset[name].weight.data.shape[1] // args.tp
                 else:
                     groupsize = args.w_groupsize
-                
+                groupsize = _fmt_w_groupsize(site_fmt(args, _w_site_key(i, name), "w"), groupsize)
+
                 gptq[name].fasterquant(
                     percdamp=args.percdamp, groupsize=groupsize, actorder=args.act_order, static_groups=False
                 )
@@ -330,7 +353,8 @@ def rtn_fwrd(model, dev, args):
                 groupsize = args.w_groupsize
             quantizer = WeightQuantizer()
             quantizer.configure(
-                layer_weight_bits, groupsize=groupsize, sym=not(args.w_asym), mse=args.gptq_mse
+                layer_weight_bits, groupsize=groupsize, sym=not(args.w_asym), mse=args.gptq_mse,
+                fmt_cfg=site_fmt(args, _w_site_key(i, name), "w")
             )
             W = subset[name].weight.data
             w_dtype = W.dtype

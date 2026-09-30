@@ -18,7 +18,7 @@ nmp: 1                         # block-FP GEMM count (higher = more accurate, sl
 gemm_bits: 8                   # GEMM unit width w. 8 = int8 byte-split (native fold; nmp 1/3/4/6).
 #                              # 2/4 = w-bit emulation -> valid nmp 1/3/4/6/9/10/15/16
 #                              # (e.g. w=4 nmp=4 == w=8 nmp=1). w only applies to ozaki1*.
-byte_split_style: all_signed_clamp_pos   # integer chunk method (default). other choices:
+byte_split_style: all_signed_no_clamp   # integer chunk method (default). other choices:
 #                              #   all_signed_clamp (legacy abs-max) / all_signed_no_clamp
 #                              #   (MSB digit +-2^(w-1); ozaki1_fp only).
 k: 32                          # reduction-dim chunk size

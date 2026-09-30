@@ -1,0 +1,6 @@
+{
+  "w": {"pool": ["int4_pc", "mxint4", "mxfp4"], "select": "mse"},
+  "a": {"pool": ["int4_pt", "mxint4", "mxfp4"], "select": "mse"},
+  "k": {"pool": ["int4_g128", "mxint4", "mxfp4"], "select": "mse"},
+  "v": {"pool": ["int4_g128", "mxint4", "mxfp4"], "select": "mse"}
+}

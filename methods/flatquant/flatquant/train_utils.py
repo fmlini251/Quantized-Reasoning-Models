@@ -2,13 +2,14 @@ import os
 import time
 import gc
 import functools
+from collections import Counter
 from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 
 from .function_utils import set_require_grad_all, get_n_set_parameters_byname, get_paras_dict_by_name, check_params_grad
-from .quant_utils import set_quantizer_state
+from .quant_utils import set_quantizer_state, start_observe_layer, finalize_observe_layer
 
 
 def cali_flat_quant(args, model, dataloader, dev, logger, start_layer_idx=0):
@@ -112,6 +113,31 @@ def cali_flat_quant(args, model, dataloader, dev, logger, start_layer_idx=0):
                 raise NotImplementedError
 
         layer = layer.to(dev)
+
+        # E1-0 calibration format-selection freeze: choose each (layer,op,role) site's dtype from
+        # calibration (unified MSE-both scale) and freeze it BEFORE transform training ("map is
+        # input, not output"). Runs for every layer regardless of start_layer_idx so the resolved
+        # map is complete. Observed distributions are init-transform (add_diag done above), the
+        # closest pre-training proxy; final-transform re-selection is a future 2-pass ablation.
+        if getattr(args, "fmt_pools", None):
+            n_obs = start_observe_layer(layer, args.fmt_pools, f"model.layers.{i}")
+            if n_obs:
+                n_obs_samples = min(args.nsamples, getattr(args, "fmt_freeze_nsamples", 16))
+                with torch.no_grad():
+                    for j in range(n_obs_samples):
+                        layer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask,
+                              position_ids=position_ids)
+                recs = finalize_observe_layer(layer)
+                for r in recs:
+                    args.fmt_resolved[r["site_key"]] = r["fmt_id"]
+                by_role = {}
+                for r in recs:
+                    by_role.setdefault(r["role"], []).append(r["fmt_id"])
+                summary = "; ".join(
+                    f"{role}=[" + ",".join(f"{f}x{c}" for f, c in sorted(Counter(fs).items())) + "]"
+                    for role, fs in sorted(by_role.items()))
+                logger.info(f"[fmt-freeze] layer {i}: {summary}")
+
         set_require_grad_all(layer, False)
         trained_params, paras_name = [], []
         if args.cali_trans:

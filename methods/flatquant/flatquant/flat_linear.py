@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .quant_utils import WeightQuantizer, ActivationQuantizer
+from .fmt_bridge import role_fmt
 from .flat_utils import kronecker_matmul
 
 
@@ -21,9 +22,9 @@ class FlatQuantizedLinear(nn.Module):
             self.groupsize = -1
 
         self.weight_quantizer = WeightQuantizer()
-        self.weight_quantizer.configure(args.w_bits, groupsize=self.groupsize, sym=not(args.w_asym), mse=False)
+        self.weight_quantizer.configure(args.w_bits, groupsize=self.groupsize, sym=not(args.w_asym), mse=False, fmt_cfg=role_fmt(args, "w"))
         if act_quantizer is None:
-            self.act_quantizer = ActivationQuantizer(bits=args.a_bits, sym=not(args.a_asym), lac=args.lac, groupsize=self.groupsize, num_groups=self.num_groups)
+            self.act_quantizer = ActivationQuantizer(bits=args.a_bits, sym=not(args.a_asym), lac=args.lac, groupsize=self.groupsize, num_groups=self.num_groups, fmt_cfg=role_fmt(args, "a"))
         else:
             self.act_quantizer = act_quantizer
 

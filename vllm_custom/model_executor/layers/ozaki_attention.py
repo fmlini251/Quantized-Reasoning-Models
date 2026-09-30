@@ -172,13 +172,19 @@ def _gather_kv_from_cache(key_cache, value_cache, block_table, seq_len, num_kv_h
 def install_ozaki_attention_backend(nmp=None, chunk_size=32, rslt_type="ozaki1_fp", s=None,
                                     scale_method="new_compressed", shift_bits=7, M_frac_bits=8,
                                     gemm_bits=8, byte_split_style="all_signed_clamp_pos", flash=None,
-                                    nmp_overrides=None, kv_cache_prefill=False):
+                                    nmp_overrides=None, kv_cache_prefill=False, flash_exact=None,
+                                    pack_dtype="bf16"):
     """Monkeypatch vLLM's attention-backend selector to return OzakiAttentionBackend.
     Call BEFORE the LLM is built (attention layers resolve the backend at construction).
 
     flash: None (default) leaves OZAKI_ATTN_FLASH as-is; True/False sets it. When enabled (and
     rslt_type==ozaki1_fp) attention runs through the Triton flash_ozaki kernel (online-softmax,
     non-cached, GQA-fold) instead of the eager batched_gemm path -- same ozaki1_fp math, ~e-3 apart.
+    flash_exact: None (default) leaves OZAKI_ATTN_FLASH_EXACT as-is; True/False sets it. When enabled
+    (requires flash) the flash kernel runs its PLAIN bf16 path (flash_oz1fp_cg ozaki=False,
+    _flash_exact_fwd) instead of the ozaki digit-plane GEMM -- a triton-flash-bf16 baseline that shares
+    the exact online-softmax/causal/GQA-fold structure of the ozaki flash, differing ONLY in the QK/PV
+    dot (single bf16 dot vs digit-plane plan). Isolates the pure ozaki-quantization effect on MATH-500.
     nmp_overrides: {regex: nmp} applied to the attention ops too -- match "attn_weights" (QK^T =
     attn_score) and/or "attn_output" (P@V) to give the two attention GEMMs different nmp.
     kv_cache_prefill: NOT IMPLEMENTED -- caching the ozaki digit-planes of K/V would multiply the
@@ -194,6 +200,8 @@ def install_ozaki_attention_backend(nmp=None, chunk_size=32, rslt_type="ozaki1_f
             "decode gain. Use the default non-cached flash path (--ozaki_flash) instead.")
     if flash is not None:
         os.environ["OZAKI_ATTN_FLASH"] = "1" if flash else "0"
+    if flash_exact is not None:
+        os.environ["OZAKI_ATTN_FLASH_EXACT"] = "1" if flash_exact else "0"
     if nmp is not None:
         set_ozaki_attention_params(nmp, chunk_size, rslt_type, s, scale_method, shift_bits,
                                    M_frac_bits, gemm_bits, byte_split_style, nmp_overrides)
@@ -206,6 +214,7 @@ def install_ozaki_attention_backend(nmp=None, chunk_size=32, rslt_type="ozaki1_f
         os.environ["OZAKI_ATTN_SHIFT_BITS"] = str(shift_bits)
         os.environ["OZAKI_ATTN_M_FRAC_BITS"] = str(M_frac_bits)
         os.environ["OZAKI_ATTN_GEMM_BITS"] = str(gemm_bits)
+        os.environ["OZAKI_ATTN_PACK_DTYPE"] = pack_dtype
         os.environ["OZAKI_ATTN_BYTE_SPLIT_STYLE"] = byte_split_style
         # per-op nmp overrides -> JSON env for spawned TP workers.
         os.environ["OZAKI_ATTN_NMP_OVERRIDES"] = (json.dumps(nmp_overrides) if nmp_overrides else "")
@@ -275,6 +284,9 @@ class OzakiAttentionImpl(XFormersImpl):
             _style = p.get("byte_split_style", "all_signed_clamp_pos")
             self._oz_flash = (_flash_req and p["rslt_type"] == "ozaki1_fp"
                               and _style == "all_signed_no_clamp")
+            # flash_exact: run the flash kernel's PLAIN bf16 path (ozaki=False) -- a triton-flash-bf16
+            # baseline that shares the ozaki flash's exact softmax/GQA structure, GEMM in bf16.
+            self._oz_flash_exact = self._oz_flash and os.environ.get("OZAKI_ATTN_FLASH_EXACT", "0") == "1"
             if _flash_req and not self._oz_flash:
                 import logging
                 logging.getLogger("vllm").warning(
@@ -288,7 +300,8 @@ class OzakiAttentionImpl(XFormersImpl):
                 logging.getLogger("vllm").warning(
                     "[Ozaki] OzakiAttentionImpl ACTIVE in pid=%d (nmp=%s, rslt=%s, mode=%s) -- "
                     "attention QK^T/PV via ozaki", os.getpid(), p["nmp"], p["rslt_type"],
-                    "flash" if self._oz_flash else "eager")
+                    ("flash-bf16(exact)" if self._oz_flash_exact else "flash")
+                    if self._oz_flash else "eager")
 
     def _flash(self, q4, k4, v4, name, kv_lens=None, split_kv=False):
         """Ozaki1_fp Triton flash kernel. q4:[B,Hq,T,D]; k4,v4:[B,Hkv,N,D] (GQA folded internally).
@@ -303,17 +316,45 @@ class OzakiAttentionImpl(XFormersImpl):
         numerics as the non-split path (n_splits=1 is bit-identical)."""
         from flash_ozaki.flash_oz1fp_codegen import flash_oz1fp_cg
         p = self._oz_p; w = p["gemm_bits"]; cs = p["chunk_size"]
+        pack = os.environ.get("OZAKI_ATTN_PACK_DTYPE", "bf16")   # bf16 | fp16 super-digit packing
         nmp_qk = _resolve_nmp(name + ".attn_weights", self._oz_ovr, p["nmp"])
         nmp_pv = _resolve_nmp(name + ".attn_output", self._oz_ovr, p["nmp"])
         D = q4.shape[-1]
+        if self._oz_flash_exact:
+            # triton-flash-bf16 baseline: the SAME kernel's plain bf16 path (ozaki=False,
+            # _flash_exact_fwd). Same chunk_size -> same BLOCK_N/kv-tiling/online-softmax as the ozaki
+            # flash, so the ONLY difference vs the ozaki run is the QK/PV dot (bf16 vs digit-plane).
+            #
+            # At DECODE it also runs flash-decoding with the SAME `decode_num_splits` as the ozaki
+            # path. The split count is not numerically neutral (each split adds a p=1 anchor that
+            # rounds exactly in bf16), so a control that splits differently from the arm it controls
+            # carries a different amount of that artefact. Sharing the count is what makes an
+            # ozaki-vs-control difference attributable to the digit-plane GEMM alone.
+            # gate must be IDENTICAL to the ozaki branch below (incl. `cs < D`), or the control would
+            # split where the arm it controls does not.
+            if split_kv and q4.shape[2] == 1 and cs is not None and cs < D:
+                import triton
+                from flash_ozaki.flash_oz1fp_codegen import flash_oz1fp_cg_splitkv, decode_num_splits
+                zc = q4.shape[0] * k4.shape[1]
+                n_tiles = max(1, -(-k4.shape[2] // triton.next_power_of_2(cs)))
+                nsm = torch.cuda.get_device_properties(q4.device).multi_processor_count
+                ns = decode_num_splits(zc, n_tiles, n_sm=nsm)
+                if ns > 1:
+                    return flash_oz1fp_cg_splitkv(q4, k4, v4, nmp=nmp_qk, w=w, nmp_pv=nmp_pv, w_pv=w,
+                                                  causal=True, sm_scale=self.scale, chunk_size=cs,
+                                                  byte_split_style=p["byte_split_style"],
+                                                  kv_lens=kv_lens, n_splits=ns, ozaki=False)
+            return flash_oz1fp_cg(q4, k4, v4, nmp=nmp_qk, w=w, nmp_pv=nmp_pv, w_pv=w, causal=True,
+                                  sm_scale=self.scale, chunk_size=cs,
+                                  byte_split_style=p["byte_split_style"], kv_lens=kv_lens, ozaki=False)
         if split_kv and q4.shape[2] == 1 and cs is not None and cs < D:   # decode + chunked path only
             import triton
-            from flash_ozaki.flash_oz1fp_codegen import flash_oz1fp_cg_splitkv
+            from flash_ozaki.flash_oz1fp_codegen import flash_oz1fp_cg_splitkv, decode_num_splits
             B, Hkv, N = q4.shape[0], k4.shape[1], k4.shape[2]
             nsm = torch.cuda.get_device_properties(q4.device).multi_processor_count
             zc = max(1, B * Hkv)
             n_tiles = max(1, -(-N // triton.next_power_of_2(cs)))         # ceil(N / BLOCK_N)
-            n_splits = max(1, min(-(-16 * nsm // zc), n_tiles, 32))       # ~oversubscribe SMs, capped
+            n_splits = decode_num_splits(zc, n_tiles, n_sm=nsm)           # shared with the exact control
             if n_splits > 1:
                 return flash_oz1fp_cg_splitkv(q4, k4, v4, nmp=nmp_qk, w=w, nmp_pv=nmp_pv, w_pv=w,
                                               causal=True, sm_scale=self.scale, chunk_size=cs,
@@ -321,7 +362,7 @@ class OzakiAttentionImpl(XFormersImpl):
                                               n_splits=n_splits)
         return flash_oz1fp_cg(q4, k4, v4, nmp=nmp_qk, w=w, nmp_pv=nmp_pv, w_pv=w, causal=True,
                               sm_scale=self.scale, chunk_size=cs,
-                              byte_split_style=p["byte_split_style"], kv_lens=kv_lens)
+                              byte_split_style=p["byte_split_style"], kv_lens=kv_lens, pack_dtype=pack)
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata, output=None):
         assert self.attn_type == AttentionType.DECODER, \

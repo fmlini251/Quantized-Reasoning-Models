@@ -1,0 +1,38 @@
+# TRITON-FLASH-BF16 BASELINE on MATH-500, in vLLM.
+#
+# Attention runs through the SAME Triton flash_ozaki kernel as the ozaki-flash experiments, but in its
+# PLAIN bf16 path (flash_oz1fp_cg ozaki=False, _flash_exact_fwd) -- one bf16 QK/PV dot instead of the
+# ozaki digit-plane GEMM. Linear layers stay native bf16 (ozaki_placement=attn_only). So this is a
+# "linear/attn both bf16" control that shares the ozaki flash's online-softmax / causal / GQA-fold /
+# kv-tiling machinery, isolating the pure ozaki-quantization effect when compared against an ozaki
+# flash run under the same generation config.
+#
+# NOTE: this vLLM (0.7.0) has NO CUDA-selectable Triton attention backend (its triton_flash_attention.py
+# is ROCm-only); flash_oz1fp_cg is the only Triton flash-attention on CUDA here. The stock bf16 baseline
+# (ozaki_placement=off) instead uses vllm-flash-attn (FLASH_ATTN) -- a DIFFERENT kernel, not bit-exact
+# to this triton path (same accuracy ~2e-3 vs fp32, different reduction order).
+#
+# Run (2 GPUs -> TP=2 auto):
+#   CUDA_VISIBLE_DEVICES=2,3 conda run -n quantized-reasoning-models \
+#       python inference_vllm.py --config configs/flash_bf16_baseline_math500.yaml
+
+# --- model / dataset ---
+model: ./modelzoo/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
+dataset: MATH-500
+
+# --- triton-flash-bf16 baseline ---
+ozaki_placement: attn_only     # attention via the flash kernel; linear stays native bf16 (stock Qwen2)
+rslt_type: ozaki1_fp           # required to pass the flash gate (inert numerically when ozaki=False)
+ozaki_flash: true              # route attention through the flash_ozaki Triton kernel
+ozaki_flash_exact: true        # ...but its PLAIN bf16 path (ozaki=False) -> triton-flash-bf16, NOT ozaki
+byte_split_style: all_signed_no_clamp  # required for the flash gate (inert when ozaki=False)
+gemm_bits: 8                   # inert when ozaki=False (no digit planes)
+nmp: 1                         # inert when ozaki=False
+k: 32                          # chunk_size -> BLOCK_N kv-tile = 32, matching the ozaki flash structure
+
+# --- generation (paper settings; identical to the ozaki flash / bf16 baseline runs) ---
+temperature: 0.6
+top_p: 0.95
+seed: 42
+max_new_tokens: 32768
+max_model_length: 32768

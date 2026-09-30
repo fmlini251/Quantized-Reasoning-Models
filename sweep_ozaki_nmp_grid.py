@@ -46,6 +46,17 @@ needs ~2x48GB, so TP=2):
     CUDA_VISIBLE_DEVICES=0,2 python sweep_ozaki_nmp_grid.py --dry-run  # print the plan only
     python sweep_ozaki_nmp_grid.py --print-table                      # re-render from disk
 
+Targeting one nmp first (--priority-nmp N pulls N's row+column to the front, rest of the grid
+follows in the usual order). --only-priority stops after them, which is what lets two sweeps share
+one results file: `linear` takes the row, `attn` takes the column minus the shared corner cell, so
+the two cell sets are disjoint and every write re-harvests the other's finished cells from disk.
+
+    CUDA_VISIBLE_DEVICES=0,1 python sweep_ozaki_nmp_grid.py --gemm-bits 5 --priority-nmp 3
+    CUDA_VISIBLE_DEVICES=0,1 python sweep_ozaki_nmp_grid.py --gemm-bits 5 --priority-nmp 3 \
+        --priority-axis linear --only-priority        # the L=3 row
+    CUDA_VISIBLE_DEVICES=2,3 python sweep_ozaki_nmp_grid.py --gemm-bits 5 --priority-nmp 3 \
+        --priority-axis attn   --only-priority        # the A=3 column (minus L=3,A=3)
+
 Outputs: outputs/sweep_nmp_grid/results.json (machine-readable) + results.md (the rendered
 table), refreshed after every cell. Per-cell stdout/stderr -> logs/sweep_nmp_grid/<cell>.log.
 """
@@ -85,11 +96,22 @@ BF16 = "BF16"
 NMP_VALUES = [1, 3, 4, 6, 9, 10, 15]
 AXIS = NMP_VALUES + [BF16]            # least -> most accurate (== rank order)
 ACC_FLOOR = 0.8                       # cell <= this => stop lowering nmp past it (prune worse cells)
+ALL_CELLS = []                        # the full 64-cell grid; set by main(), read by merge_disk()
 
 OUT_DIR = "outputs/sweep_nmp_grid"
 LOG_DIR = "logs/sweep_nmp_grid"
-RES_JSON = "results_flash.json" if USE_FLASH else "results.json"   # keep the eager grid intact
-RES_MD = "results_flash.md" if USE_FLASH else "results.md"
+PACK_DTYPE = "bf16"                   # super-digit packing dtype for the flash kernel (bf16|fp16)
+
+
+def _res_names():
+    """Result filenames. w=4 + bf16 keeps the historical names so the existing grid is never
+    clobbered; any other (w, pack_dtype) gets its own pair of files."""
+    base = "results_flash" if USE_FLASH else "results"
+    if GEMM_BITS != 4:
+        base += f"_w{GEMM_BITS}"
+    if PACK_DTYPE != "bf16":
+        base += f"_{PACK_DTYPE}"
+    return base + ".json", base + ".md"
 INFERENCE_DIR = "outputs/inference"   # where inference_vllm.py writes its canonical hash dirs
 
 # Known-good reference hashes (config -> dir suffix) used as a startup self-check. The hash
@@ -151,6 +173,7 @@ def canonical_args(spec):
         "nmp": (6 if spec["nmp"] is None else spec["nmp"]),  # 6 = inference_vllm default (off: unused)
         "nmp_overrides": spec["overrides"],
         "gemm_bits": GEMM_BITS, "byte_split_style": BYTE_SPLIT_STYLE,
+        "pack_dtype": PACK_DTYPE,
         # ozaki-2 only (ignored for ozaki1_fp; excluded from this scheme's hash)
         "s": None, "s_overrides": None, "scale_method": "new_compressed",
         "shift_bits": 7, "M_frac_bits": 8, "combine_fp64": False,
@@ -188,6 +211,8 @@ def _cell_fields(spec):
     f = {"ozaki_placement": p, "rslt_type": RSLT_TYPE, "k": K, "weight_cache": WEIGHT_CACHE,
          "nmp": spec["nmp"], "nmp_overrides": spec["overrides"], "gemm_bits": GEMM_BITS,
          "byte_split_style": BYTE_SPLIT_STYLE, "dtype": "bfloat16", "seed": 42}
+    if PACK_DTYPE != "bf16":
+        f["pack_dtype"] = PACK_DTYPE      # fp16 packing cells must not match a bf16 run
     if USE_FLASH and p in ("attn_only", "full"):
         f["ozaki_flash"] = True           # flash cells must match a flash run, never the eager one
     return f
@@ -200,19 +225,35 @@ def _field_eq(saved, want):
     return saved == want                  # None==None, int==int, dict==dict (order-independent)
 
 
-def result_jsonl(spec):
-    """Existing result jsonl for a spec, located by globbing the model's run dirs and confirming the
+_DISK = None                          # cached [(jsonl_path, saved_args)] of every run dir on disk
+
+
+def disk_scan(refresh=False):
+    """Every finished run dir as (jsonl path, saved args), read once and cached: a full re-harvest
+    touches this list 64 times (once per cell), and re-globbing/re-parsing per cell made that
+    O(cells x dirs) file reads."""
+    global _DISK
+    if _DISK is None or refresh:
+        name = MODEL.rstrip("/").split("/")[-1]
+        scan = []
+        for j in sorted(glob.glob(os.path.join(INFERENCE_DIR, f"model={name}__*", f"{DATASET}.jsonl"))):
+            aj = os.path.join(os.path.dirname(j), f"{DATASET}.args.json")
+            try:
+                scan.append((j, json.load(open(aj))))
+            except (OSError, json.JSONDecodeError):
+                continue
+        _DISK = scan
+    return _DISK
+
+
+def result_jsonl(spec, refresh=False):
+    """Existing result jsonl for a spec, located by scanning the model's run dirs and confirming the
     CELL-DEFINING fields in each candidate's <dataset>.args.json -- robust to inference_vllm.py adding
     new hashed-but-non-result args (the repeated cause of 'no_output' on completed cells). Falls back
-    to the canonical path (where a fresh run will land) when nothing on disk matches yet."""
+    to the canonical path (where a fresh run will land) when nothing on disk matches yet. Pass
+    refresh=True right after a run finishes -- its dir is newer than the cached scan."""
     want = _cell_fields(spec)
-    name = MODEL.rstrip("/").split("/")[-1]
-    for j in sorted(glob.glob(os.path.join(INFERENCE_DIR, f"model={name}__*", f"{DATASET}.jsonl"))):
-        aj = os.path.join(os.path.dirname(j), f"{DATASET}.args.json")
-        try:
-            saved = json.load(open(aj))
-        except (OSError, json.JSONDecodeError):
-            continue
+    for j, saved in disk_scan(refresh):
         if all(_field_eq(saved.get(k), v) for k, v in want.items()):
             return j
     return canonical_jsonl(spec)
@@ -246,6 +287,8 @@ def build_cmd(spec):
         cmd += ["--nmp_overrides", ",".join(f"{n}={v}" for n, v in spec["overrides"].items())]
     if USE_FLASH and spec["placement"] in ("attn_only", "full"):
         cmd += ["--ozaki_flash"]
+    if PACK_DTYPE != "bf16":
+        cmd += ["--pack_dtype", PACK_DTYPE]
     return cmd
 
 
@@ -255,15 +298,20 @@ def self_check():
     is canonical_args gaining/losing a hashed field. The four references are LEGACY dirs, so we
     reproduce them through the same `methods=None` shim legacy_jsonl() uses -- if canonical_args
     changes shape this trips, instead of silently missing every cached cell."""
+    global GEMM_BITS, PACK_DTYPE
+    _w, _pd = GEMM_BITS, PACK_DTYPE
+    GEMM_BITS, PACK_DTYPE = 4, "bf16"     # the four reference dirs are w=4/bf16 legacy runs
     bad = []
     for want, (placement, nmp, ov) in _SELFCHECK.items():
         spec = dict(placement=placement, nmp=nmp, overrides=ov)
         a = dict(canonical_args(spec))
         a.pop("ozaki_flash", None)       # refs are eager legacy; check the flash-independent base hash
         a["methods"] = None
+        a.pop("pack_dtype", None)        # legacy dirs predate pack_dtype
         got = make_run_tag(a).split("__")[-1]
         if got != want:
             bad.append(f"  {placement} nmp={nmp} ov={ov}: expected {want}, got {got}")
+    GEMM_BITS, PACK_DTYPE = _w, _pd
     if bad:
         raise SystemExit("Canonical-hash self-check FAILED (canonical_args changed?):\n"
                          + "\n".join(bad))
@@ -295,17 +343,42 @@ def render_table(results):
     return "\n".join(lines)
 
 
+def merge_disk(results):
+    """Fold every cell that now has a result on disk but no accuracy in `results` back in. Called
+    before each write so a sweep restricted to part of the grid (--only-priority) still renders the
+    whole table, and so two concurrent sweeps sharing one results file pick up each other's finished
+    cells instead of clobbering them."""
+    disk_scan(refresh=True)
+    for c in ALL_CELLS:
+        if results.get(c, {}).get("acc") is not None:
+            continue
+        path = result_jsonl(cell_to_run(*c))
+        acc = read_accuracy(path)
+        if acc is not None:
+            results[c] = {"status": "reused", "acc": acc, "path": path}
+    return results
+
+
+def _write_atomic(path, text):
+    """Write via temp + rename: concurrent sweeps then never read a half-written file."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
 def write_outputs(results):
     os.makedirs(OUT_DIR, exist_ok=True)
+    merge_disk(results)
     serial = {f"L={L}|A={A}": rec for (L, A), rec in results.items()}
-    with open(os.path.join(OUT_DIR, RES_JSON), "w") as f:
-        json.dump(serial, f, indent=2, default=str)
+    RES_JSON, RES_MD = _res_names()
+    _write_atomic(os.path.join(OUT_DIR, RES_JSON), json.dumps(serial, indent=2, default=str))
     table = render_table(results)
-    with open(os.path.join(OUT_DIR, RES_MD), "w") as f:
-        f.write(f"# Ozaki1_fp (w=4) nmp sweep — {DATASET} extractive_match\n\n")
-        f.write("Rows = linear-layer nmp, cols = attention nmp, BF16 = native. "
-                f"`prune` = skipped (dominated by a <= {ACC_FLOOR} cell).\n\n```\n")
-        f.write(table + "\n```\n")
+    _write_atomic(os.path.join(OUT_DIR, RES_MD),
+                  f"# Ozaki1_fp (w={GEMM_BITS}) nmp sweep — {DATASET} extractive_match\n\n"
+                  "Rows = linear-layer nmp, cols = attention nmp, BF16 = native. "
+                  f"`prune` = skipped (dominated by a <= {ACC_FLOOR} cell).\n\n```\n"
+                  + table + "\n```\n")
     return table
 
 
@@ -313,6 +386,7 @@ def write_outputs(results):
 # main sweep
 # --------------------------------------------------------------------------------------------
 def main():
+    global GEMM_BITS, PACK_DTYPE
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dry-run", action="store_true",
@@ -321,9 +395,29 @@ def main():
                     help="Re-read every cell from disk, render the table, and exit.")
     ap.add_argument("--acc-floor", type=float, default=ACC_FLOOR,
                     help=f"Collapse threshold; cells <= this prune lower-nmp cells (default {ACC_FLOOR}).")
+    ap.add_argument("--gemm-bits", type=int, default=4, choices=[2, 3, 4, 5, 6, 7, 8],
+                    help="Ozaki-1 GEMM unit width w for BOTH axes (default 4). "
+                         "int_bits = w*nD-1 sets the accuracy ladder, so a different w is a "
+                         "different experiment and gets its own results_*.json/md.")
+    ap.add_argument("--pack-dtype", type=str, default="bf16", choices=["bf16", "fp16"],
+                    help="Super-digit packing dtype of the flash ATTENTION kernel (linear layers go "
+                         "through production, which is always bf16-packed). Only changes anything "
+                         "when w does not divide 8 (w=5: g 1->2).")
     ap.add_argument("--timeout-hours", type=float, default=None,
                     help="Optional per-cell wall-clock cap (a degenerate full/attn run can take days).")
+    ap.add_argument("--priority-nmp", type=str, default=None,
+                    help="Comma-separated nmp value(s) whose row/column jump to the front of the "
+                         "queue (e.g. 3). The rest of the grid follows in the normal order.")
+    ap.add_argument("--priority-axis", choices=["both", "linear", "attn"], default="both",
+                    help="Which cells --priority-nmp selects: the row AND column (both, default), "
+                         "the LINEAR row only, or the ATTENTION column only. `attn` also drops the "
+                         "cells already in the priority row, so `linear` and `attn` split the "
+                         "row+column into two disjoint halves that can run side by side.")
+    ap.add_argument("--only-priority", action="store_true",
+                    help="Run ONLY the --priority-nmp cells and exit (the table still renders the "
+                         "whole grid from disk).")
     args = ap.parse_args()
+    GEMM_BITS, PACK_DTYPE = args.gemm_bits, args.pack_dtype
     floor = args.acc_floor
 
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -331,12 +425,14 @@ def main():
 
     # Cells, bottom-right first: highest combined rank (most accurate / fastest) leads, so every
     # strict dominator of a cell is evaluated before it -> the prune below is always well-informed.
-    cells = sorted(((L, A) for L in AXIS for A in AXIS),
-                   key=lambda c: (rank(c[0]) + rank(c[1]), rank(c[0]), rank(c[1])), reverse=True)
+    global ALL_CELLS
+    ALL_CELLS = sorted(((L, A) for L in AXIS for A in AXIS),
+                       key=lambda c: (rank(c[0]) + rank(c[1]), rank(c[0]), rank(c[1])), reverse=True)
 
-    # Seed results from disk (resume / reuse existing canonical runs).
+    # Seed results from disk (resume / reuse existing canonical runs). Always over the FULL grid, so
+    # the rendered table keeps every cell even when this process only runs part of it.
     results = {}
-    for L, A in cells:
+    for L, A in ALL_CELLS:
         path = result_jsonl(cell_to_run(L, A))
         acc = read_accuracy(path)
         if acc is not None:
@@ -345,6 +441,32 @@ def main():
     if args.print_table:
         print(render_table(results))
         return
+
+    # Optional re-ordering: pull one nmp's row/column to the front. ALL_CELLS is already
+    # rank-descending, so a STABLE partition keeps bottom-right-first order within each group. The
+    # prune below stays sound either way (it only fires on an actually-observed <= floor cell), it
+    # just has fewer dominators in hand when a priority cell runs out of rank order.
+    cells = list(ALL_CELLS)
+    if args.priority_nmp:
+        prio = [int(v) for v in args.priority_nmp.split(",") if v.strip()]
+        bad = [v for v in prio if v not in NMP_VALUES]
+        if bad:
+            raise SystemExit(f"--priority-nmp: {bad} not a grid nmp {NMP_VALUES}")
+
+        def in_prio(c):
+            L, A = c
+            if args.priority_axis == "linear":
+                return L in prio
+            if args.priority_axis == "attn":
+                return A in prio and L not in prio   # disjoint from the `linear` half
+            return L in prio or A in prio
+
+        cells.sort(key=lambda c: 0 if in_prio(c) else 1)
+        if args.only_priority:
+            cells = [c for c in cells if in_prio(c)]
+        print(f"Priority: nmp={prio} ({args.priority_axis}) first"
+              + (" — ONLY these cells" if args.only_priority else "")
+              + f" -> {sum(1 for c in cells if in_prio(c))} cell(s).")
 
     failed = [c for c, r in results.items() if r.get("acc") is not None and r["acc"] <= floor]
 
@@ -400,7 +522,7 @@ def main():
                 write_outputs(results)
                 continue
 
-        path = result_jsonl(spec)
+        path = result_jsonl(spec, refresh=True)   # this run's dir is newer than the cached scan
         acc = read_accuracy(path)
         dt = (time.time() - t0) / 60.0
         if acc is None:
@@ -417,7 +539,8 @@ def main():
 
     print("\n" + render_table(results))
     if not args.dry_run:
-        print(f"\nWrote {OUT_DIR}/{RES_JSON} and {OUT_DIR}/{RES_MD}"
+        res_json, res_md = _res_names()      # local: write_outputs() computes its own copy
+        print(f"\nWrote {OUT_DIR}/{res_json} and {OUT_DIR}/{res_md}"
               + ("   [FLASH attention sweep]" if USE_FLASH else ""))
 
 

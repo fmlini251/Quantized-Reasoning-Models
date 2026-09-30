@@ -42,6 +42,17 @@ def parser_gen():
                         help='Percent of the average Hessian diagonal to use for dampening.')
     parser.add_argument('--act_order', action="store_true", default=False,
                         help='Use act-order in GPTQ.')
+    parser.add_argument('--fmt_config', type=str, default=None,
+                        help='''W14: JSON (file path or inline) mapping roles w/a/q/k/v to
+                                lossless_444 fmt_lib formats, e.g. '{"a": {"fmt": "mxint4"},
+                                "w": {"fmt": "mxfp4"}}'. Absent roles keep the original uniform
+                                INT quantizer. Bits gating stays with --*_bits (must be <16 for
+                                every role listed here).''')
+    parser.add_argument('--fmt_freeze_nsamples', type=int, default=16,
+                        help='''E1-0: number of calibration samples used by the format-selection
+                                observe pass to freeze each site's dtype. Weights are static and
+                                per-block activation format preference is stable, so a small cap
+                                keeps the freeze cheap (clamped to --nsamples).''')
 
     # FlatQuant calibration Arguments
     parser.add_argument('--epochs', type=int, default=15, help='Number of training epochs.')
@@ -128,6 +139,13 @@ def parser_gen():
     
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args.quantize = (args.w_bits < 16) or (args.a_bits < 16) or (args.q_bits < 16) or (args.k_bits < 16) or (args.v_bits < 16)
+    # W14/E1-0: parse --fmt_config into fixed grids (args.fmt_cfg) + calib pools (args.fmt_pools).
+    # args.fmt_resolved {site_key: fmt_id} is filled by the calibration freeze pass.
+    from . import fmt_bridge
+    args.fmt_cfg, args.fmt_pools = fmt_bridge.load_fmt_config(args.fmt_config)
+    args.fmt_resolved = {}
+    if args.fmt_cfg or args.fmt_pools:
+        fmt_bridge.validate_bits(args)
     # cache path
     args.cache_dir = os.path.join(args.output_dir, ".cache")
     os.makedirs(args.cache_dir, exist_ok=True)
@@ -135,7 +153,13 @@ def parser_gen():
     args.model_name = args.model.split("/")[-1]
     args.exp_dir = os.path.join(args.output_dir, args.model_name, f"w{args.w_bits}a{args.a_bits}", args.exp_name)
     os.makedirs(args.exp_dir, exist_ok=True)
-    
+    if args.fmt_cfg or args.fmt_pools:  # record the fmt directives for the run manifest (SS0.3)
+        import json as _json
+        from dataclasses import asdict as _asdict
+        with open(os.path.join(args.exp_dir, "fmt_config.resolved.json"), "w") as f:
+            _json.dump({"fixed": {r: _asdict(c) for r, c in args.fmt_cfg.items()},
+                        "pools": args.fmt_pools}, f, indent=2)
+
     logger = create_logger(args.exp_dir)
     logger.info('Arguments: ')
     logger.info(pprint.pformat(vars(args)))
